@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="format-detection" content="telephone=no, email=no, address=no, date=no">
+<meta name="theme-color" content="#013E44">
+<title>Host — AI &amp; LLM Live Quiz</title>
+<link rel="stylesheet" href="style.css">
+<script src="webview-fit.js"></script>
+</head>
+<body>
+
+<div class="bg-orb orb1"></div>
+<div class="bg-orb orb2"></div>
+
+<div class="wrap">
+  <div class="card" id="card">
+    <div class="center-msg"><span class="big-emoji">📡</span>Connecting…</div>
+  </div>
+  <div class="foot-note" id="footnote">Host console</div>
+</div>
+
+<!-- Persistent connection badge (Alpine) — lives outside #card so it survives
+     every screen re-render (lobby → question → reveal → final). -->
+<div style="position:fixed;top:max(14px, env(safe-area-inset-top));left:50%;transform:translateX(-50%);z-index:60;"
+     x-data="{ online: navigator.onLine }"
+     x-init="window.addEventListener('online', () => online = true); window.addEventListener('offline', () => online = false);">
+  <span class="conn-badge is-offline" x-show="!online" x-cloak>
+    <span class="dot"></span> Offline — reconnecting…
+  </span>
+</div>
+
+<!-- Copy-room-code toast (Alpine) — shown when the host taps the room code
+     in the lobby screen; listens for a 'roomcodecopied' event dispatched
+     from vanilla JS below. -->
+<div x-data="{ show: false }" x-show="show" x-cloak x-transition
+     x-on:roomcodecopied.window="show = true; clearTimeout(window.__toastTimer); window.__toastTimer = setTimeout(() => show = false, 1600)"
+     class="toast">
+  ✓ Room code copied
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.2/anime.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.14.1/cdn.min.js"></script>
+<script src="firebase-init.js"></script>
+<script src="questions.js"></script>
+<script>
+const SHAPES = [
+  { key: "A", cls: "shape-a", glyph: "▲" },
+  { key: "B", cls: "shape-b", glyph: "◆" },
+  { key: "C", cls: "shape-c", glyph: "●" },
+  { key: "D", cls: "shape-d", glyph: "■" },
+];
+
+const card = document.getElementById("card");
+const footnote = document.getElementById("footnote");
+
+let roomCode = null;
+let roomRef = null;
+let playersRef = null;
+let answersRef = null;
+let playersCache = {};
+let countdownTimer = null;
+let questionRevealing = false; // guards against double-reveal (timeout vs. everyone-answered racing)
+let autoAdvanceTimer = null; // ticks down on the reveal screen, then auto-continues
+let currentRoomState = null; // mirrors last known room snapshot
+
+// The quiz actually being played this game — chosen on the setup screen,
+// then embedded into the room so every player reads the same fixed list.
+let currentQuestions = DEFAULT_QUESTIONS;
+let currentSeconds = DEFAULT_QUESTION_SECONDS;
+let currentQuizName = "AI & LLM Knowledge Check";
+let dareEnabled = true;
+let daresCache = DEFAULT_DARES.slice();
+let dareRevealed = false;
+// Remembers the last dare actually landed on — persisted in sessionStorage
+// so the no-repeat rule survives the full page reload "Start a New Game"
+// does between games, not just multiple spins within one page load.
+let lastDareShown = null;
+try { lastDareShown = sessionStorage.getItem("lastDareShown"); } catch (e) { /* storage unavailable — fine, just no repeat-guard */ }
+
+function pickRandomDare(pool) {
+  if (pool.length <= 1) return pool[0];
+  let choice;
+  do {
+    choice = pool[Math.floor(Math.random() * pool.length)];
+  } while (choice === lastDareShown);
+  return choice;
+}
+
+// Used for the slot-machine flicker mid-spin — just avoids showing the
+// exact same line on two consecutive ticks, purely cosmetic.
+function pickDifferentDare(pool, avoid) {
+  if (pool.length <= 1) return pool[0];
+  let choice;
+  do {
+    choice = pool[Math.floor(Math.random() * pool.length)];
+  } while (choice === avoid);
+  return choice;
+}
+
+function esc(str) {
+  const d = document.createElement("div");
+  d.textContent = String(str);
+  return d.innerHTML;
+}
+
+// Small helper so every screen change gets a consistent, lively mount-in —
+// used throughout instead of relying on the CSS .card animation alone.
+function animateCardIn() {
+  if (window.anime) {
+    anime({
+      targets: "#card",
+      opacity: [0, 1],
+      translateY: [16, 0],
+      duration: 420,
+      easing: "easeOutQuad",
+    });
+  }
+}
+
+function genCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O or 1/I
+  let out = "";
+  for (let i = 0; i < 4; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+function sortedPlayers() {
+  return Object.entries(playersCache)
+    .map(([id, p]) => ({ id, name: p.name || "Player", score: p.score || 0 }))
+    .sort((a, b) => b.score - a.score);
+}
+
+function leaderboardTableHTML(list, limit) {
+  const top = limit ? list.slice(0, limit) : list;
+  if (!top.length) return `<p class="hint">No players have scored yet.</p>`;
+  const rankClass = (i) => (i === 0 ? "gold" : i === 1 ? "silver" : i === 2 ? "bronze" : "");
+  return `
+    <table class="leaderboard">
+      <thead><tr><th>Player</th><th>Score</th></tr></thead>
+      <tbody>
+        ${top.map((p, i) => `
+          <tr>
+            <td><span class="rank ${rankClass(i)}">${i + 1}</span>${esc(p.name)}</td>
+            <td>${p.score}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+function animateLeaderboardRows() {
+  if (window.anime) {
+    anime({
+      targets: "table.leaderboard tbody tr",
+      opacity: [0, 1],
+      translateX: [-16, 0],
+      delay: anime.stagger(55),
+      duration: 380,
+      easing: "easeOutQuad",
+    });
+  }
+}
+
+/* ---------- Podium: special banners for the top 3 finishers ---------- */
+// Reveal order is bronze → silver → gold (builds a little suspense before
+// the winner lands) regardless of how many places actually have a player
+// in them. Alpine (x-data/x-show/x-transition below) owns the reveal
+// timing/visibility; animatePodium() layers anime.js flourishes on top
+// once everything has mounted.
+const PODIUM_DELAYS = { 1: [150], 2: [150, 650], 3: [150, 550, 1000] };
+
+function podiumHTML(list, myId) {
+  const top = list.slice(0, 3);
+  if (!top.length) return "";
+  const medal = ["🥇", "🥈", "🥉"];
+  const cls = ["podium-gold", "podium-silver", "podium-bronze"];
+  const revealOrder = top.length === 3 ? [2, 1, 0] : top.length === 2 ? [1, 0] : [0];
+  const delays = PODIUM_DELAYS[top.length];
+  const revealInit = revealOrder.map((rankIdx, seq) => `setTimeout(() => r[${rankIdx}]=true, ${delays[seq]})`).join("; ");
+
+  const cards = top.map((p, i) => `
+    <div class="podium-card ${cls[i]} ${myId && p.id === myId ? "me" : ""}" x-show="r[${i}]" x-cloak
+         x-transition:enter="pod-enter" x-transition:enter-start="pod-enter-start" x-transition:enter-end="pod-enter-end">
+      ${i === 0 ? `<span class="podium-crown">👑</span>` : ""}
+      <span class="podium-medal">${medal[i]}</span>
+      <span class="podium-name">${esc(p.name)}</span>
+      <span class="podium-score">${p.score} pts</span>
+    </div>`).join("");
+
+  return `<div class="podium" x-data="{ r: [false,false,false] }" x-init="${revealInit}">${cards}</div>`;
+}
+
+function podiumConfettiDelay(n) {
+  return n >= 3 ? 1150 : n === 2 ? 800 : n === 1 ? 350 : 0;
+}
+
+function animatePodium(n) {
+  if (!window.anime || !n) return;
+  const goldDelay = PODIUM_DELAYS[n][PODIUM_DELAYS[n].length - 1];
+  anime({ targets: ".podium-crown", rotate: [-14, 12, -6, 0], duration: 700, delay: goldDelay + 380, easing: "easeInOutSine" });
+  anime({ targets: ".podium-gold .podium-score", scale: [1, 1.18, 1], duration: 420, delay: goldDelay + 380, easing: "easeOutQuad" });
+}
+
+/* ---------- Setup screen: pick a quiz before opening the room ---------- */
+
+let setupSets = {};      // questionSets from Firebase, keyed by id
+let setupSelectedId = null; // null = built-in default quiz
+let setupListenerRef = null;
+
+function initSetup() {
+  card.innerHTML = `<div class="center-msg"><span class="big-emoji">📡</span>Loading quiz sets…</div>`;
+  setupListenerRef = db.ref("questionSets");
+  setupListenerRef.on("value", (snap) => {
+    setupSets = snap.val() || {};
+    renderSetup();
+  });
+  db.ref("dares").once("value").then((snap) => {
+    const val = snap.val();
+    if (val) daresCache = Array.isArray(val) ? val.filter(Boolean) : Object.values(val);
+  }).catch(() => {});
+}
+
+function renderSetup() {
+  footnote.textContent = "Set up a new game";
+  const customEntries = Object.entries(setupSets)
+    .filter(([, s]) => s && Array.isArray(s.questions) && s.questions.length)
+    .sort((a, b) => (a[1].name || "").localeCompare(b[1].name || ""));
+
+  const defaultOption = `
+    <div class="setup-option ${setupSelectedId === null ? "selected" : ""}" data-id="__default__">
+      <div>
+        <div class="so-name">${esc(currentQuizName)}</div>
+        <div class="so-meta">${DEFAULT_QUESTIONS.length} questions · Built-in default</div>
+      </div>
+      <span class="so-radio"></span>
+    </div>`;
+
+  const customOptions = customEntries.map(([id, s]) => `
+    <div class="setup-option ${setupSelectedId === id ? "selected" : ""}" data-id="${id}">
+      <div>
+        <div class="so-name">${esc(s.name || "Untitled set")}</div>
+        <div class="so-meta">${s.questions.length} question${s.questions.length === 1 ? "" : "s"} · Custom set</div>
+      </div>
+      <span class="so-radio"></span>
+    </div>`).join("");
+
+  card.innerHTML = `
+    <span class="on-air"><span class="dot"></span>New game</span>
+    <h1 style="margin-top:14px;">Choose a Quiz</h1>
+    <p class="lead">Pick which question set to play, or build your own in the admin console.</p>
+    <div class="setup-list">
+      ${defaultOption}
+      ${customOptions}
+    </div>
+    <label class="toggle-row"><input type="checkbox" id="dareToggle" ${dareEnabled ? "checked" : ""}> Spin a fun dare for last place at the end</label>
+    <button class="btn btn-primary" id="createRoomBtn">Create Room</button>
+    <p class="hint" style="text-align:center;margin-top:14px;">
+      <button class="link-btn" id="manageBtn" type="button">＋ Manage quiz sets &amp; dares</button>
+    </p>
+  `;
+  animateCardIn();
+
+  card.querySelectorAll(".setup-option").forEach((el) => {
+    el.addEventListener("click", () => {
+      setupSelectedId = el.dataset.id === "__default__" ? null : el.dataset.id;
+      renderSetup();
+    });
+  });
+  document.getElementById("dareToggle").addEventListener("change", (e) => { dareEnabled = e.target.checked; });
+  document.getElementById("manageBtn").addEventListener("click", () => window.openOrNavigate("admin.html"));
+  document.getElementById("createRoomBtn").addEventListener("click", confirmSetupAndCreateRoom);
+}
+
+function confirmSetupAndCreateRoom() {
+  if (setupSelectedId === null) {
+    currentQuestions = DEFAULT_QUESTIONS;
+    currentSeconds = DEFAULT_QUESTION_SECONDS;
+    currentQuizName = "AI & LLM Knowledge Check";
+  } else {
+    const chosen = setupSets[setupSelectedId];
+    if (!chosen || !Array.isArray(chosen.questions) || !chosen.questions.length) return;
+    currentQuestions = chosen.questions;
+    currentSeconds = chosen.seconds || DEFAULT_QUESTION_SECONDS;
+    currentQuizName = chosen.name || "Custom Quiz";
+  }
+  // Shuffle both the order questions appear in AND each question's option
+  // order, for this game only — produces new arrays/objects, so the source
+  // (DEFAULT_QUESTIONS or the admin's saved set) is never mutated. Done once
+  // here, then embedded into the room, so every player and the host see the
+  // exact same shuffled game — just different from the last time it was played.
+  currentQuestions = shuffleArray(currentQuestions);
+  currentQuestions = shuffleQuestionOptions(currentQuestions);
+  if (setupListenerRef) { setupListenerRef.off(); setupListenerRef = null; }
+  createRoom();
+}
+
+/* ---------- Shuffling: answer options (per game) + dare pool (per spin) ---------- */
+
+// Fisher–Yates — unbiased in-place shuffle of a copy of the array.
+function shuffleArray(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function shuffleQuestionOptions(questions) {
+  return questions.map((q) => {
+    const order = shuffleArray([0, 1, 2, 3]); // order[newPos] = originalIndex
+    return {
+      ...q,
+      options: order.map((origIdx) => q.options[origIdx]),
+      answer: order.indexOf(q.answer),
+    };
+  });
+}
+
+/* ---------- Room lifecycle ---------- */
+
+async function createRoom() {
+  roomCode = genCode();
+  roomRef = db.ref("rooms/" + roomCode);
+  playersRef = roomRef.child("players");
+  answersRef = roomRef.child("answers");
+
+  await roomRef.set({
+    status: "lobby",
+    qIndex: -1,
+    total: currentQuestions.length,
+    questions: currentQuestions,
+    questionSeconds: currentSeconds,
+    quizName: currentQuizName,
+    dareEnabled,
+    createdAt: firebase.database.ServerValue.TIMESTAMP,
+  });
+
+  roomRef.onDisconnect().update({ hostLeft: true });
+
+  playersRef.on("value", (snap) => {
+    playersCache = snap.val() || {};
+    if (currentRoomState && currentRoomState.status === "lobby") renderLobby();
+  });
+
+  roomRef.on("value", (snap) => {
+    const val = snap.val();
+    if (!val) return;
+    const prev = currentRoomState;
+    currentRoomState = val;
+    // React to status transitions driven elsewhere only if needed later.
+    if (!prev) renderLobby();
+  });
+}
+
+/* ---------- Screens ---------- */
+
+function renderLobby() {
+  footnote.textContent = "Room " + roomCode + " · Lobby";
+  const players = sortedPlayers();
+  card.innerHTML = `
+    <span class="on-air"><span class="dot"></span>Room open</span>
+    <p class="eyebrow" style="margin-top:14px;">${esc(currentQuizName)}</p>
+    <div class="room-code" id="roomCodeEl" title="Tap to copy">${roomCode}</div>
+    <p class="room-code-copy-hint">Tap the code to copy it</p>
+    <p class="hint" style="text-align:center;">On player.html, enter this code and a name to join.</p>
+
+    <div class="q-header" style="margin-top:24px;">
+      <span class="player-count-label">${players.length} player${players.length === 1 ? "" : "s"} joined</span>
+    </div>
+    <div class="player-chip-grid" id="chipGrid">
+      ${players.map(p => `<span class="player-chip">${esc(p.name)}</span>`).join("") || `<span class="hint">Waiting for players…</span>`}
+    </div>
+
+    <button class="btn btn-primary" id="startBtn" ${players.length ? "" : "disabled"}>
+      Start Game ${players.length ? `(${players.length} ready)` : ""}
+    </button>
+    <p class="hint">${currentQuestions.length} questions · ${currentSeconds}s each · faster correct answers score more</p>
+  `;
+  animateCardIn();
+  if (window.anime) {
+    anime({ targets: "#chipGrid .player-chip", opacity: [0, 1], scale: [0.7, 1], delay: anime.stagger(40), duration: 320, easing: "easeOutBack" });
+  }
+  const startBtn = document.getElementById("startBtn");
+  if (startBtn) startBtn.addEventListener("click", startGame);
+
+  const roomCodeEl = document.getElementById("roomCodeEl");
+  if (roomCodeEl) {
+    roomCodeEl.addEventListener("click", async () => {
+      const ok = await window.copyToClipboard(roomCode);
+      if (ok) window.dispatchEvent(new CustomEvent("roomcodecopied"));
+    });
+  }
+}
+
+async function startGame() {
+  await roomRef.update({ qIndex: 0 });
+  await goToQuestion(0);
+}
+
+async function goToQuestion(idx) {
+  clearInterval(countdownTimer);
+  clearInterval(autoAdvanceTimer);
+  await roomRef.update({
+    status: "question",
+    qIndex: idx,
+    qStartedAt: firebase.database.ServerValue.TIMESTAMP,
+  });
+  // Read back the resolved server timestamp so the host's own countdown is accurate.
+  const snap = await roomRef.child("qStartedAt").once("value");
+  const startedAt = snap.val() || Date.now();
+  renderQuestionLive(idx, startedAt);
+}
+
+function renderQuestionLive(idx, startedAt) {
+  questionRevealing = false;
+  const item = currentQuestions[idx];
+  const total = currentQuestions.length;
+  footnote.textContent = `Room ${roomCode} · Question ${idx + 1} of ${total}`;
+
+  card.innerHTML = `
+    <div class="q-header">
+      <span class="q-progress-label">QUESTION ${idx + 1} OF ${total}</span>
+      <div class="timer-ring-wrap">
+        <svg width="64" height="64" viewBox="0 0 64 64">
+          <circle class="timer-ring-track" cx="32" cy="32" r="27"></circle>
+          <circle class="timer-ring-fill" id="ringFill" cx="32" cy="32" r="27"
+            stroke-dasharray="${2 * Math.PI * 27}" stroke-dashoffset="0"></circle>
+        </svg>
+        <div class="timer-ring-num" id="ringNum">${currentSeconds}</div>
+      </div>
+    </div>
+    <p class="question-text">${esc(item.q)}</p>
+    <div class="vote-rows" id="voteRows">
+      ${item.options.map((opt, i) => voteRowHTML(SHAPES[i], opt, 0, 0, false)).join("")}
+    </div>
+    <p class="hint" id="liveCount" style="text-align:center;margin-top:16px;">0 answers in…</p>
+    <button class="btn btn-primary" id="revealBtn">Reveal Answer Now</button>
+  `;
+  animateCardIn();
+  if (window.anime) {
+    anime({ targets: "#voteRows .vote-row", opacity: [0, 1], translateY: [10, 0], delay: anime.stagger(60), duration: 340, easing: "easeOutQuad" });
+  }
+  document.getElementById("revealBtn").addEventListener("click", () => revealAnswer(idx));
+
+  const circumference = 2 * Math.PI * 27;
+  const ringFill = document.getElementById("ringFill");
+  const ringNum = document.getElementById("ringNum");
+  let lastPulseSecond = null;
+
+  countdownTimer = setInterval(() => {
+    const elapsed = (Date.now() - startedAt) / 1000;
+    const remaining = Math.max(0, currentSeconds - elapsed);
+    const ratio = remaining / currentSeconds;
+    ringFill.setAttribute("stroke-dashoffset", String(circumference * (1 - ratio)));
+    ringFill.style.stroke = remaining <= 5 ? "var(--wrong)" : "var(--mint)";
+    const secondsLeft = Math.ceil(remaining);
+    ringNum.textContent = secondsLeft;
+    if (remaining <= 5 && remaining > 0 && secondsLeft !== lastPulseSecond && window.anime) {
+      lastPulseSecond = secondsLeft;
+      anime({ targets: "#ringNum", scale: [1, 1.3, 1], duration: 420, easing: "easeInOutSine" });
+    }
+    if (remaining <= 0) {
+      clearInterval(countdownTimer);
+      revealAnswer(idx);
+    }
+  }, 200);
+
+  answersRef.child(idx).on("value", (snap) => {
+    const answers = snap.val() || {};
+    const counts = [0, 0, 0, 0];
+    Object.values(answers).forEach((a) => {
+      if (a && typeof a.choice === "number") counts[a.choice] = (counts[a.choice] || 0) + 1;
+    });
+    updateVoteRows(counts, null);
+
+    const n = Object.keys(answers).length;
+    const playerCount = Object.keys(playersCache).length;
+    const liveCountEl = document.getElementById("liveCount");
+    const allIn = playerCount > 0 && n >= playerCount;
+
+    if (liveCountEl) {
+      liveCountEl.textContent = allIn
+        ? "Everyone's answered — revealing…"
+        : `${n} of ${playerCount} answered…`;
+    }
+
+    // Don't make a room full of people who already tapped an answer sit
+    // through the rest of the countdown — reveal as soon as every
+    // currently-joined player is in. A short beat lets the "Everyone's
+    // answered" message register and the last vote bar animate before
+    // the reveal screen swaps in; questionRevealing (set inside
+    // revealAnswer) protects against this racing the timeout-triggered
+    // reveal if both fire close together.
+    if (allIn && !questionRevealing) {
+      clearInterval(countdownTimer);
+      setTimeout(() => revealAnswer(idx), 500);
+    }
+  });
+}
+
+function voteRowHTML(shape, optText, count, total, revealMode, isCorrect) {
+  const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+  return `
+    <div class="vote-row ${revealMode && isCorrect ? "correct-row" : ""}" data-shape="${shape.key}">
+      <span class="glyph ${shape.cls}">${shape.glyph}</span>
+      <div class="bar-track">
+        <div class="bar-fill ${shape.cls}" style="width:${pct}%;" data-count="${count}"></div>
+        <span class="bar-label">${esc(optText)}${revealMode && isCorrect ? " ✓" : ""}</span>
+      </div>
+      <span class="bar-count">${count}</span>
+    </div>`;
+}
+
+function updateVoteRows(counts, correctIdx) {
+  const rows = document.querySelectorAll("#voteRows .vote-row, #revealRows .vote-row");
+  const total = counts.reduce((a, b) => a + b, 0);
+  rows.forEach((row, i) => {
+    const fill = row.querySelector(".bar-fill");
+    const countEl = row.querySelector(".bar-count");
+    const pct = total > 0 ? Math.round((counts[i] / total) * 100) : 0;
+    if (fill) fill.style.width = pct + "%";
+    if (countEl) countEl.textContent = counts[i];
+    if (correctIdx !== null) row.classList.toggle("correct-row", i === correctIdx);
+  });
+}
+
+async function revealAnswer(idx) {
+  if (questionRevealing) return;
+  questionRevealing = true;
+  clearInterval(countdownTimer);
+  answersRef.child(idx).off();
+  await roomRef.update({ status: "reveal" });
+
+  const item = currentQuestions[idx];
+  const snap = await answersRef.child(idx).once("value");
+  const answers = snap.val() || {};
+  const counts = [0, 0, 0, 0];
+  Object.values(answers).forEach((a) => {
+    if (a && typeof a.choice === "number") counts[a.choice] = (counts[a.choice] || 0) + 1;
+  });
+  const total = currentQuestions.length;
+  const isLast = idx === total - 1;
+
+  footnote.textContent = `Room ${roomCode} · Answer revealed`;
+  card.innerHTML = `
+    <p class="eyebrow">Answer Revealed</p>
+    <p class="question-text">${esc(item.q)}</p>
+    <div class="vote-rows" id="revealRows">
+      ${item.options.map((opt, i) => voteRowHTML(SHAPES[i], opt, counts[i], total, true, i === item.answer)).join("")}
+    </div>
+    <h2 style="margin-top:28px;">Leaderboard so far</h2>
+    ${leaderboardTableHTML(sortedPlayers(), 5)}
+    <button class="btn btn-primary" id="nextBtn">${isLast ? "Show Final Results" : "Next Question"}</button>
+    <p class="hint" id="autoNextHint" style="text-align:center;margin-top:10px;"></p>
+  `;
+  animateCardIn();
+  animateLeaderboardRows();
+
+  // Continue automatically after a short beat on the reveal screen — the
+  // host no longer has to click through every single question. Clicking
+  // "Next Question" (or "Show Final Results") at any time jumps ahead
+  // immediately and cancels the countdown.
+  const AUTO_ADVANCE_SECONDS = 6;
+  let secondsLeft = AUTO_ADVANCE_SECONDS;
+  let advanced = false;
+  const hintEl = document.getElementById("autoNextHint");
+  const setHint = () => { if (hintEl) hintEl.textContent = `Auto-continuing in ${secondsLeft}s… (tap the button to skip ahead)`; };
+  setHint();
+
+  const proceed = () => {
+    if (advanced) return;
+    advanced = true;
+    clearInterval(autoAdvanceTimer);
+    if (isLast) renderFinal();
+    else goToQuestion(idx + 1);
+  };
+
+  clearInterval(autoAdvanceTimer);
+  autoAdvanceTimer = setInterval(() => {
+    secondsLeft -= 1;
+    if (secondsLeft <= 0) { clearInterval(autoAdvanceTimer); proceed(); return; }
+    setHint();
+  }, 1000);
+
+  document.getElementById("nextBtn").addEventListener("click", proceed);
+}
+
+async function renderFinal() {
+  clearInterval(autoAdvanceTimer);
+  dareRevealed = false;
+  await roomRef.update({ status: "final" });
+  footnote.textContent = `Room ${roomCode} · Final results`;
+  const list = sortedPlayers();
+  const podiumCount = Math.min(list.length, 3);
+  card.innerHTML = `
+    <p class="eyebrow">Game Over</p>
+    <h1>Final Leaderboard</h1>
+    ${podiumHTML(list)}
+    ${leaderboardTableHTML(list)}
+    <div id="dareSlot"></div>
+    <button class="btn btn-ghost" style="margin-top:20px;width:100%;" id="newGameBtn">Start a New Game</button>
+  `;
+  animateCardIn();
+  animateLeaderboardRows();
+  animatePodium(podiumCount);
+  document.getElementById("newGameBtn").addEventListener("click", () => location.reload());
+  if (list.length) setTimeout(launchConfetti, podiumConfettiDelay(podiumCount));
+
+  if (dareEnabled && list.length) renderDarePrompt(list);
+}
+
+/* ---------- Fun element: spin a dare for the last-place player ---------- */
+
+function renderDarePrompt(list) {
+  const target = list[list.length - 1];
+  const slot = document.getElementById("dareSlot");
+  if (!slot) return;
+  slot.innerHTML = `
+    <div class="dare-actions" id="darePrompt">
+      <button class="btn btn-primary" style="margin-top:0;" id="spinDareBtn">🎯 Spin a Dare for ${esc(target.name)}</button>
+      <button class="link-btn" id="skipDareBtn" type="button">No thanks, skip it</button>
+    </div>
+  `;
+  document.getElementById("spinDareBtn").addEventListener("click", () => spinDare(target));
+  document.getElementById("skipDareBtn").addEventListener("click", () => { slot.innerHTML = ""; });
+}
+
+function spinDare(target) {
+  if (dareRevealed) return;
+  dareRevealed = true;
+  const slot = document.getElementById("dareSlot");
+  if (!slot) return;
+  const pool = daresCache.length ? daresCache : DEFAULT_DARES;
+  const finalDare = pickRandomDare(pool);
+
+  slot.innerHTML = `
+    <div class="dare-card" id="dareCard">
+      <p class="dc-eyebrow">🎯 Last-Place Dare</p>
+      <p class="dc-target">${esc(target.name)}, this one's for you…</p>
+      <p class="dc-text" id="dareText">🎲</p>
+    </div>
+  `;
+  if (window.anime) {
+    anime({ targets: "#dareCard", opacity: [0, 1], scale: [0.85, 1], duration: 400, easing: "easeOutQuad" });
+  }
+
+  // Slot-machine cycle: flash through random dares, slowing down, then land
+  // on the real pick and write it to the room so players see it too.
+  const dareTextEl = document.getElementById("dareText");
+  let ticks = 0;
+  const totalTicks = 14;
+  function tick() {
+    ticks++;
+    const showing = ticks < totalTicks ? pickDifferentDare(pool, dareTextEl.textContent) : finalDare;
+    dareTextEl.textContent = showing;
+    if (window.anime) {
+      anime({ targets: "#dareText", opacity: [0.3, 1], translateY: [6, 0], duration: 140, easing: "easeOutQuad" });
+    }
+    if (ticks < totalTicks) {
+      setTimeout(tick, 70 + ticks * 16); // decelerate
+    } else {
+      lastDareShown = finalDare;
+      try { sessionStorage.setItem("lastDareShown", finalDare); } catch (e) { /* ignore */ }
+      if (window.anime) {
+        anime({ targets: "#dareCard", scale: [1, 1.04, 1], duration: 500, easing: "easeOutElastic(1, .6)" });
+      }
+      roomRef.child("dare").set({
+        text: finalDare,
+        targetName: target.name,
+        revealedAt: firebase.database.ServerValue.TIMESTAMP,
+      });
+    }
+  }
+  tick();
+}
+
+function launchConfetti() {
+  const colors = ["#FF6B57", "#F2C94C", "#7B61FF", "#02C39A", "#028090"];
+  for (let i = 0; i < 60; i++) {
+    const el = document.createElement("div");
+    el.className = "confetti-piece";
+    el.style.left = Math.random() * 100 + "vw";
+    el.style.background = colors[Math.floor(Math.random() * colors.length)];
+    el.style.animationDuration = 2.5 + Math.random() * 1.8 + "s";
+    el.style.animationDelay = Math.random() * 0.6 + "s";
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 5200);
+  }
+}
+
+initSetup();
+</script>
+
+</body>
+</html>
