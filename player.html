@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#013E44">
+<title>Join — AI &amp; LLM Live Quiz</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="bg-orb orb1"></div>
+<div class="bg-orb orb2"></div>
+
+<div class="wrap">
+  <div class="card" id="card"></div>
+  <div class="foot-note" id="footnote">Player</div>
+</div>
+
+<!-- Persistent connection badge (Alpine) — survives the innerJoin/question re-renders below,
+     since it lives outside #card and just watches the browser's online/offline events. -->
+<div class="toast" style="position:fixed;top:max(14px, env(safe-area-inset-top));left:50%;bottom:auto;transform:translateX(-50%);background:transparent;box-shadow:none;padding:0;z-index:60;"
+     x-data="{ online: navigator.onLine }"
+     x-init="window.addEventListener('online', () => online = true); window.addEventListener('offline', () => online = false);">
+  <span class="conn-badge" :class="online ? 'is-online' : 'is-offline'" x-show="!online" x-cloak>
+    <span class="dot"></span>
+    <span x-text="online ? 'Connected' : 'Offline — reconnecting…'"></span>
+  </span>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.2/anime.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.14.1/cdn.min.js"></script>
+<script src="firebase-init.js"></script>
+<script>
+const SHAPES = [
+  { key: "A", cls: "shape-a", glyph: "▲" },
+  { key: "B", cls: "shape-b", glyph: "◆" },
+  { key: "C", cls: "shape-c", glyph: "●" },
+  { key: "D", cls: "shape-d", glyph: "■" },
+];
+
+const card = document.getElementById("card");
+const footnote = document.getElementById("footnote");
+
+const playerId = "p_" + Math.random().toString(36).slice(2, 10);
+
+let roomCode = null;
+let roomRef = null;
+let playersRef = null;
+let answersRef = null;
+let myName = "";
+let lastRenderedKey = null; // `${status}:${qIndex}` — avoids redundant re-renders
+let qStartedAtLocal = null;
+let hasAnsweredThisQ = false;
+let localTimer = null;
+let myScore = 0;
+let streak = 0; // fun element: consecutive correct answers
+
+// Questions + timing come from the room itself now (the host picks the quiz
+// set on their setup screen and embeds it in the room), not a local file —
+// this is what lets the host run any quiz built in the admin console.
+let quizQuestions = [];
+let quizSeconds = 20;
+
+function esc(str) {
+  const d = document.createElement("div");
+  d.textContent = String(str);
+  return d.innerHTML;
+}
+
+function animateCardIn() {
+  if (window.anime) {
+    anime({ targets: "#card", opacity: [0, 1], translateY: [16, 0], duration: 420, easing: "easeOutQuad" });
+  }
+}
+
+/* ---------- Join screen ---------- */
+
+function renderJoin(errorMsg) {
+  footnote.textContent = "Join a live game";
+  card.innerHTML = `
+    <div x-data="{ code: '', name: '' }">
+      <span class="on-air"><span class="dot"></span>Live game</span>
+      <h1 style="margin-top:14px;">Join the Quiz</h1>
+      <p class="lead">Enter the room code from the host's screen and pick a name.</p>
+      <label for="codeInput">Room code</label>
+      <input type="text" id="codeInput" class="code-input" maxlength="4" placeholder="XXXX" autocomplete="off"
+        inputmode="text" autocapitalize="characters"
+        x-model="code" x-on:input="code = code.toUpperCase().slice(0, 4)" />
+      <label for="nameInput" style="margin-top:16px;">Your name</label>
+      <input type="text" id="nameInput" placeholder="e.g. Priya" maxlength="24" autocomplete="off"
+        x-model="name" />
+      <p class="hint" style="text-align:right;margin-top:6px;" x-text="name.length + '/24'"></p>
+      <button class="btn btn-primary" id="joinBtn" :disabled="code.length !== 4 || !name.trim()">Join Game</button>
+      <p class="error-text">${errorMsg ? esc(errorMsg) : ""}</p>
+    </div>
+  `;
+  animateCardIn();
+  const codeInput = document.getElementById("codeInput");
+  const nameInput = document.getElementById("nameInput");
+  const joinBtn = document.getElementById("joinBtn");
+  codeInput.focus();
+  [codeInput, nameInput].forEach((el) => {
+    el.addEventListener("keydown", (e) => { if (e.key === "Enter" && !joinBtn.disabled) joinBtn.click(); });
+  });
+  joinBtn.addEventListener("click", () => attemptJoin(codeInput.value, nameInput.value));
+}
+
+async function attemptJoin(codeRaw, nameRaw) {
+  const code = codeRaw.trim().toUpperCase();
+  const name = nameRaw.trim().slice(0, 24);
+  if (code.length !== 4) return renderJoin("Enter the 4-character room code.");
+  if (!name) return renderJoin("Enter your name.");
+
+  const candidateRoomRef = db.ref("rooms/" + code);
+  let snap;
+  try {
+    snap = await candidateRoomRef.once("value");
+  } catch (e) {
+    return renderJoin("Couldn't reach the game server. Check your connection.");
+  }
+  const room = snap.val();
+  if (!room) return renderJoin("No game found with that code.");
+  if (room.status !== "lobby") return renderJoin("This game has already started — ask the host for a new code.");
+
+  roomCode = code;
+  roomRef = candidateRoomRef;
+  playersRef = roomRef.child("players");
+  answersRef = roomRef.child("answers");
+  myName = name;
+  quizQuestions = Array.isArray(room.questions) ? room.questions : [];
+  quizSeconds = room.questionSeconds || 20;
+  streak = 0;
+
+  await playersRef.child(playerId).set({
+    name: myName,
+    score: 0,
+    joinedAt: firebase.database.ServerValue.TIMESTAMP,
+  });
+  playersRef.child(playerId).onDisconnect().remove();
+
+  listenToRoom();
+}
+
+/* ---------- Live room listener ---------- */
+
+function listenToRoom() {
+  roomRef.on("value", (snap) => {
+    const room = snap.val();
+    if (!room) return;
+    if (Array.isArray(room.questions) && room.questions.length) quizQuestions = room.questions;
+    if (room.questionSeconds) quizSeconds = room.questionSeconds;
+
+    const key = room.status + ":" + room.qIndex;
+    if (room.status === "lobby") {
+      if (lastRenderedKey !== key) { lastRenderedKey = key; renderWaiting(); }
+    } else if (room.status === "question") {
+      if (lastRenderedKey !== key) {
+        lastRenderedKey = key;
+        hasAnsweredThisQ = false;
+        qStartedAtLocal = room.qStartedAt || Date.now();
+        renderQuestion(room.qIndex, qStartedAtLocal);
+      }
+    } else if (room.status === "reveal") {
+      if (lastRenderedKey !== key) {
+        lastRenderedKey = key;
+        renderFeedback(room.qIndex);
+      }
+    } else if (room.status === "final") {
+      if (lastRenderedKey !== key) {
+        lastRenderedKey = key;
+        renderFinal();
+      }
+    }
+  });
+
+  playersRef.child(playerId).child("score").on("value", (snap) => {
+    myScore = snap.val() || 0;
+    const scoreEl = document.getElementById("myScoreReadout");
+    if (scoreEl) scoreEl.textContent = myScore;
+  });
+
+  // The host may spin a last-place dare after the final screen is already
+  // showing — this listener updates the banner live without a full re-render.
+  roomRef.child("dare").on("value", (snap) => {
+    const dare = snap.val();
+    if (dare) showDareBanner(dare);
+  });
+}
+
+function renderWaiting() {
+  clearInterval(localTimer);
+  footnote.textContent = "Room " + roomCode + " · Lobby";
+  card.innerHTML = `
+    <div class="center-msg">
+      <span class="big-emoji">🎮</span>
+      You're in, <strong>${esc(myName)}</strong>!<br>Waiting for the host to start the game…
+    </div>
+  `;
+  animateCardIn();
+}
+
+/* ---------- Question screen ---------- */
+
+function renderQuestion(idx, startedAt) {
+  clearInterval(localTimer);
+  const item = quizQuestions[idx];
+  const total = quizQuestions.length;
+  if (!item) return; // questions haven't synced yet — next snapshot will retry
+  footnote.textContent = `Room ${roomCode} · Question ${idx + 1} of ${total}`;
+
+  card.innerHTML = `
+    <div class="q-header">
+      <span class="q-progress-label">QUESTION ${idx + 1} OF ${total}</span>
+      <div class="timer-ring-wrap">
+        <svg width="64" height="64" viewBox="0 0 64 64">
+          <circle class="timer-ring-track" cx="32" cy="32" r="27"></circle>
+          <circle class="timer-ring-fill" id="ringFill" cx="32" cy="32" r="27"
+            stroke-dasharray="${2 * Math.PI * 27}" stroke-dashoffset="0"></circle>
+        </svg>
+        <div class="timer-ring-num" id="ringNum">${quizSeconds}</div>
+      </div>
+    </div>
+    <p class="question-text">${esc(item.q)}</p>
+    <div class="shape-grid" id="shapeGrid">
+      ${item.options.map((opt, i) => `
+        <button class="shape-btn ${SHAPES[i].cls}" data-i="${i}">
+          <span class="glyph">${SHAPES[i].glyph}</span>
+          <span>${esc(opt)}</span>
+        </button>
+      `).join("")}
+    </div>
+    <p class="hint" id="statusLine" style="text-align:center;margin-top:16px;">Tap your answer before time runs out.</p>
+  `;
+  animateCardIn();
+
+  const buttons = Array.from(document.querySelectorAll(".shape-btn"));
+  if (window.anime) {
+    anime({ targets: buttons, opacity: [0, 1], translateY: [14, 0], delay: anime.stagger(70), duration: 380, easing: "easeOutQuad" });
+  }
+  buttons.forEach((btn) => {
+    btn.addEventListener("click", () => submitAnswer(idx, parseInt(btn.dataset.i, 10), startedAt, buttons, btn));
+  });
+
+  const circumference = 2 * Math.PI * 27;
+  const ringFill = document.getElementById("ringFill");
+  const ringNum = document.getElementById("ringNum");
+  let lastPulseSecond = null;
+
+  localTimer = setInterval(() => {
+    const elapsed = (Date.now() - startedAt) / 1000;
+    const remaining = Math.max(0, quizSeconds - elapsed);
+    const ratio = remaining / quizSeconds;
+    if (ringFill) {
+      ringFill.setAttribute("stroke-dashoffset", String(circumference * (1 - ratio)));
+      ringFill.style.stroke = remaining <= 5 ? "var(--wrong)" : "var(--mint)";
+    }
+    const secondsLeft = Math.ceil(remaining);
+    if (ringNum) ringNum.textContent = secondsLeft;
+    if (remaining <= 5 && remaining > 0 && secondsLeft !== lastPulseSecond && window.anime) {
+      lastPulseSecond = secondsLeft;
+      anime({ targets: "#ringNum", scale: [1, 1.3, 1], duration: 420, easing: "easeInOutSine" });
+    }
+    if (remaining <= 0) {
+      clearInterval(localTimer);
+      if (!hasAnsweredThisQ) lockInTimeout(idx, buttons);
+    }
+  }, 200);
+}
+
+function submitAnswer(idx, choice, startedAt, buttons, chosenBtn) {
+  if (hasAnsweredThisQ) return;
+  hasAnsweredThisQ = true;
+  clearInterval(localTimer);
+
+  const item = quizQuestions[idx];
+  const correct = choice === item.answer;
+  const elapsedMs = Date.now() - startedAt;
+  const remainingRatio = Math.max(0, Math.min(1, 1 - elapsedMs / (quizSeconds * 1000)));
+  const points = correct ? Math.round(500 + 500 * remainingRatio) : 0;
+  streak = correct ? streak + 1 : 0;
+
+  buttons.forEach((b) => { b.disabled = true; if (b !== chosenBtn) b.classList.add("dimmed"); });
+  if (window.anime) {
+    anime({ targets: chosenBtn, scale: [1, 1.06, 1], duration: 260, easing: "easeOutQuad" });
+  }
+  const statusLine = document.getElementById("statusLine");
+  if (statusLine) statusLine.textContent = "Answer locked in — waiting for the host…";
+
+  answersRef.child(idx).child(playerId).set({
+    choice,
+    correct,
+    points,
+    answeredAt: firebase.database.ServerValue.TIMESTAMP,
+  });
+  playersRef.child(playerId).child("score").transaction((cur) => (cur || 0) + points);
+}
+
+function lockInTimeout(idx, buttons) {
+  hasAnsweredThisQ = true;
+  streak = 0;
+  buttons.forEach((b) => { b.disabled = true; b.classList.add("dimmed"); });
+  const statusLine = document.getElementById("statusLine");
+  if (statusLine) statusLine.textContent = "Time's up — waiting for the host…";
+  answersRef.child(idx).child(playerId).set({
+    choice: null,
+    correct: false,
+    points: 0,
+    answeredAt: firebase.database.ServerValue.TIMESTAMP,
+  });
+}
+
+/* ---------- Feedback (reveal) screen ---------- */
+
+async function renderFeedback(idx) {
+  clearInterval(localTimer);
+  footnote.textContent = `Room ${roomCode} · Answer revealed`;
+  const item = quizQuestions[idx];
+  let mine = null;
+  try {
+    const snap = await answersRef.child(idx).child(playerId).once("value");
+    mine = snap.val();
+  } catch (e) { /* ignore */ }
+
+  const correct = !!(mine && mine.correct);
+  const points = mine ? mine.points : 0;
+  const streakBadge = correct && streak >= 2 ? `<div class="streak-badge">🔥 ${streak} in a row!</div>` : "";
+
+  card.innerHTML = `
+    <div class="feedback-hero ${correct ? "is-correct" : "is-wrong"}">
+      <div class="glyph-big" id="feedbackGlyph">${correct ? "✓" : "✕"}</div>
+      <p class="fh-title">${correct ? "Correct!" : (mine && mine.choice === null ? "Time's up" : "Not quite")}</p>
+      <p class="fh-sub">${esc(item.options[item.answer])}</p>
+      <p class="fh-points">${correct ? "+" + points + " points" : "+0 points"}</p>
+      ${streakBadge}
+    </div>
+    <div class="q-header" style="justify-content:center;">
+      <span class="player-count-label">Your total score: <span id="myScoreReadout">${myScore}</span></span>
+    </div>
+    <p class="hint" style="text-align:center;">Waiting for the host to continue…</p>
+  `;
+  animateCardIn();
+  if (window.anime) {
+    anime({
+      targets: "#feedbackGlyph",
+      scale: [0, 1],
+      rotate: correct ? [-12, 0] : [10, -6, 0],
+      duration: 520,
+      easing: "easeOutBack",
+    });
+    if (streakBadge) {
+      anime({ targets: ".streak-badge", scale: [0, 1], opacity: [0, 1], duration: 420, delay: 200, easing: "easeOutBack" });
+    }
+  }
+}
+
+/* ---------- Final screen ---------- */
+
+async function renderFinal() {
+  clearInterval(localTimer);
+  footnote.textContent = `Room ${roomCode} · Final results`;
+  let list = [];
+  try {
+    const snap = await playersRef.once("value");
+    const players = snap.val() || {};
+    list = Object.entries(players)
+      .map(([id, p]) => ({ id, name: p.name || "Player", score: p.score || 0 }))
+      .sort((a, b) => b.score - a.score);
+  } catch (e) { /* ignore */ }
+
+  const myRank = list.findIndex((p) => p.id === playerId) + 1;
+  const rankClass = (i) => (i === 0 ? "gold" : i === 1 ? "silver" : i === 2 ? "bronze" : "");
+
+  card.innerHTML = `
+    <p class="eyebrow">Game Over</p>
+    <div class="feedback-hero is-correct">
+      <div class="glyph-big">🏆</div>
+      <p class="fh-title">You finished #${myRank || "-"}</p>
+      <p class="fh-sub">${myScore} points</p>
+    </div>
+    <h2>Final Leaderboard</h2>
+    <table class="leaderboard">
+      <thead><tr><th>Player</th><th>Score</th></tr></thead>
+      <tbody>
+        ${list.map((p, i) => `
+          <tr class="${p.id === playerId ? "me" : ""}">
+            <td><span class="rank ${rankClass(i)}">${i + 1}</span>${esc(p.name)}</td>
+            <td>${p.score}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>
+    <div id="dareBanner"></div>
+    <button class="btn btn-ghost" style="margin-top:20px;width:100%;" onclick="location.reload()">Join Another Game</button>
+  `;
+  animateCardIn();
+  if (window.anime) {
+    anime({ targets: "table.leaderboard tbody tr", opacity: [0, 1], translateX: [-16, 0], delay: anime.stagger(55), duration: 380, easing: "easeOutQuad" });
+  }
+  if (myRank && myRank <= 3) launchConfetti();
+}
+
+function showDareBanner(dare) {
+  const banner = document.getElementById("dareBanner");
+  if (!banner) return; // not on the final screen right now
+  banner.innerHTML = `
+    <div class="dare-card" id="dareCard">
+      <p class="dc-eyebrow">🎯 Last-Place Dare</p>
+      <p class="dc-target">${esc(dare.targetName)}, this one's for you…</p>
+      <p class="dc-text">${esc(dare.text)}</p>
+    </div>
+  `;
+  if (window.anime) {
+    anime({ targets: "#dareCard", opacity: [0, 1], scale: [0.85, 1], duration: 450, easing: "easeOutElastic(1, .6)" });
+  }
+}
+
+function launchConfetti() {
+  const colors = ["#FF6B57", "#F2C94C", "#7B61FF", "#02C39A", "#028090"];
+  for (let i = 0; i < 50; i++) {
+    const el = document.createElement("div");
+    el.className = "confetti-piece";
+    el.style.left = Math.random() * 100 + "vw";
+    el.style.background = colors[Math.floor(Math.random() * colors.length)];
+    el.style.animationDuration = 2.5 + Math.random() * 1.8 + "s";
+    el.style.animationDelay = Math.random() * 0.6 + "s";
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 5200);
+  }
+}
+
+renderJoin();
+</script>
+
+</body>
+</html>

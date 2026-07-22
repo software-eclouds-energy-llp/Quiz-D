@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#013E44">
+<title>Admin — AI &amp; LLM Live Quiz</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="bg-orb orb1"></div>
+<div class="bg-orb orb2"></div>
+
+<div class="wrap admin-shell">
+  <div class="card" id="card"></div>
+  <div class="foot-note">Admin console · changes are saved to Firebase and used by host.html</div>
+</div>
+
+<!-- Persistent connection badge (Alpine) — survives every list/editor re-render. -->
+<div style="position:fixed;top:max(14px, env(safe-area-inset-top));left:50%;transform:translateX(-50%);z-index:60;"
+     x-data="{ online: navigator.onLine }"
+     x-init="window.addEventListener('online', () => online = true); window.addEventListener('offline', () => online = false);">
+  <span class="conn-badge is-offline" x-show="!online" x-cloak>
+    <span class="dot"></span> Offline — changes won't save
+  </span>
+</div>
+
+<!-- Scroll-to-save-bar FAB (Alpine) — handy on mobile once a question list
+     scrolls past a screen height; jumps straight to Save changes. -->
+<button type="button" class="fab" title="Jump to Save"
+  x-data="{ show: false }"
+  x-init="window.addEventListener('scroll', () => show = window.scrollY > 300)"
+  x-show="show" x-cloak x-transition
+  x-on:click="document.querySelector('.save-bar')?.scrollIntoView({ behavior: 'smooth', block: 'end' })">↓</button>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.2/anime.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.14.1/cdn.min.js"></script>
+<script src="firebase-init.js"></script>
+<script src="questions.js"></script>
+<script>
+const SHAPES = [
+  { key: "A", cls: "shape-a", glyph: "▲" },
+  { key: "B", cls: "shape-b", glyph: "◆" },
+  { key: "C", cls: "shape-c", glyph: "●" },
+  { key: "D", cls: "shape-d", glyph: "■" },
+];
+
+const card = document.getElementById("card");
+
+function esc(str) {
+  const d = document.createElement("div");
+  d.textContent = String(str);
+  return d.innerHTML;
+}
+// For text inserted inside an HTML attribute (e.g. value="..."), quotes must
+// also be escaped — esc() alone isn't enough there.
+function escAttr(str) {
+  return String(str).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function animateCardIn() {
+  if (window.anime) anime({ targets: "#card", opacity: [0, 1], translateY: [12, 0], duration: 380, easing: "easeOutQuad" });
+}
+function blankQuestion() { return { q: "", options: ["", "", "", ""], answer: 0 }; }
+function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
+
+/* ---------- Global state ---------- */
+let currentTab = "sets";       // "sets" | "dares"
+let setsView = "list";         // "list" | "editor"
+let setsCache = {};            // live from Firebase questionSets
+let setsListenerAttached = false;
+
+let editingSetId = null;       // null while creating a brand-new set
+let draft = null;              // { name, seconds, questions: [...] } — working copy
+
+let daresDraft = [];           // working copy of the dare list
+let daresLoaded = false;
+
+/* ---------- Boot ---------- */
+
+function init() {
+  card.innerHTML = `<div class="center-msg"><span class="big-emoji">📡</span>Connecting…</div>`;
+  db.ref("questionSets").on("value", (snap) => {
+    setsCache = snap.val() || {};
+    if (currentTab === "sets" && setsView === "list") renderSetsList();
+  });
+  db.ref("dares").once("value").then((snap) => {
+    const val = snap.val();
+    daresDraft = val ? (Array.isArray(val) ? val.filter(Boolean) : Object.values(val)) : [];
+    daresLoaded = true;
+    if (currentTab === "dares") renderDaresTab();
+  }).catch(() => { daresLoaded = true; });
+}
+
+function tabRowHTML() {
+  return `
+    <div class="tab-row">
+      <button class="tab-btn ${currentTab === "sets" ? "active" : ""}" data-tab="sets">Quiz Sets</button>
+      <button class="tab-btn ${currentTab === "dares" ? "active" : ""}" data-tab="dares">Last-Place Dares</button>
+    </div>`;
+}
+
+function bindTabRow() {
+  card.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (setsView === "editor" && !confirmDiscardIfNeeded()) return;
+      currentTab = btn.dataset.tab;
+      setsView = "list";
+      if (currentTab === "sets") renderSetsList();
+      else renderDaresTab();
+    });
+  });
+}
+
+function confirmDiscardIfNeeded() {
+  // Simple guard so switching tabs mid-edit doesn't silently lose work.
+  return confirm("Leave this quiz set? Unsaved changes will be lost.");
+}
+
+/* ============================================================
+   Quiz Sets — list view
+   ============================================================ */
+
+function renderSetsList() {
+  const entries = Object.entries(setsCache).sort((a, b) => (a[1].name || "").localeCompare(b[1].name || ""));
+  card.innerHTML = `
+    <p class="eyebrow">Admin Console</p>
+    <h1 style="margin-top:0;">Manage Quizzes</h1>
+    <p class="lead">Build question sets here instead of editing questions.js. The host picks any set on their setup screen.</p>
+    ${tabRowHTML()}
+    <div class="sc-actions" style="margin-bottom:16px;">
+      <button class="icon-btn primary" id="newSetBtn">＋ New blank set</button>
+      <button class="icon-btn" id="seedDefaultBtn">Start from the default AI &amp; LLM quiz</button>
+    </div>
+    <div id="setsList">
+      ${entries.length ? entries.map(([id, s]) => `
+        <div class="set-card-row">
+          <div>
+            <div class="sc-name">${esc(s.name || "Untitled set")}</div>
+            <div class="sc-meta">${(s.questions || []).length} question${(s.questions || []).length === 1 ? "" : "s"} · ${s.seconds || 20}s per question</div>
+          </div>
+          <div class="sc-actions">
+            <button class="icon-btn" data-edit="${id}">Edit</button>
+            <button class="icon-btn" data-dup="${id}">Duplicate</button>
+            <button class="icon-btn danger" data-del="${id}">Delete</button>
+          </div>
+        </div>
+      `).join("") : `<p class="hint">No custom quiz sets yet — start one above.</p>`}
+    </div>
+  `;
+  animateCardIn();
+  bindTabRow();
+  document.getElementById("newSetBtn").addEventListener("click", () => openEditor(null, { name: "New Quiz", seconds: 20, questions: [] }));
+  document.getElementById("seedDefaultBtn").addEventListener("click", () => openEditor(null, {
+    name: "AI & LLM Knowledge Check (copy)",
+    seconds: DEFAULT_QUESTION_SECONDS,
+    questions: clone(DEFAULT_QUESTIONS),
+  }));
+  card.querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", () => {
+    const id = b.dataset.edit;
+    openEditor(id, clone(setsCache[id]));
+  }));
+  card.querySelectorAll("[data-dup]").forEach((b) => b.addEventListener("click", async () => {
+    const id = b.dataset.dup;
+    const src = setsCache[id];
+    if (!src) return;
+    const newRef = db.ref("questionSets").push();
+    await newRef.set({
+      name: (src.name || "Untitled set") + " (copy)",
+      seconds: src.seconds || 20,
+      questions: src.questions || [],
+      createdAt: firebase.database.ServerValue.TIMESTAMP,
+      updatedAt: firebase.database.ServerValue.TIMESTAMP,
+    });
+  }));
+  card.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", () => {
+    const id = b.dataset.del;
+    const name = (setsCache[id] && setsCache[id].name) || "this set";
+    if (confirm(`Delete "${name}"? This can't be undone.`)) {
+      db.ref("questionSets/" + id).remove();
+    }
+  }));
+}
+
+/* ============================================================
+   Quiz Sets — editor view
+   ============================================================ */
+
+function openEditor(id, initialDraft) {
+  editingSetId = id;
+  draft = {
+    name: initialDraft.name || "Untitled quiz",
+    seconds: initialDraft.seconds || 20,
+    questions: (initialDraft.questions && initialDraft.questions.length) ? initialDraft.questions : [blankQuestion()],
+    createdAt: initialDraft.createdAt || null,
+  };
+  setsView = "editor";
+  renderSetEditor();
+}
+
+function syncDraftFromDOM() {
+  if (setsView !== "editor" || !draft) return;
+  const nameEl = document.getElementById("setNameInput");
+  const secondsEl = document.getElementById("setSecondsInput");
+  if (nameEl) draft.name = nameEl.value.trim() || "Untitled quiz";
+  if (secondsEl) draft.seconds = Math.max(5, parseInt(secondsEl.value, 10) || 20);
+  const cards = Array.from(document.querySelectorAll(".q-edit-card"));
+  if (cards.length) {
+    draft.questions = cards.map((c) => {
+      const qText = c.querySelector("textarea").value;
+      const opts = Array.from(c.querySelectorAll(".opt-row input[type=text]")).map((i) => i.value);
+      const checked = c.querySelector(".opt-row input[type=radio]:checked");
+      const answer = checked ? parseInt(checked.value, 10) : 0;
+      return { q: qText, options: opts, answer };
+    });
+  }
+}
+
+function renderSetEditor() {
+  card.innerHTML = `
+    <p class="eyebrow">Admin Console</p>
+    <button class="link-btn" id="backToListBtn" type="button">← Back to all quiz sets</button>
+    <input type="text" id="setNameInput" class="set-title-input" value="${escAttr(draft.name)}" style="margin-top:14px;" />
+    <label for="setSecondsInput">Seconds per question</label>
+    <input type="text" id="setSecondsInput" style="max-width:120px;" value="${escAttr(draft.seconds)}" />
+    <div id="questionsList" style="margin-top:20px;"></div>
+    <button class="icon-btn primary" id="addQuestionBtn" type="button">＋ Add question</button>
+    <p class="form-error" id="formError"></p>
+    <div class="save-bar">
+      <span id="saveStatus" class="hint">${editingSetId ? "Editing existing set" : "New set — not saved yet"}</span>
+      <div class="sc-actions">
+        <button class="icon-btn" id="cancelEditBtn" type="button">Cancel</button>
+        <button class="icon-btn primary" id="saveSetBtn" type="button">Save changes</button>
+      </div>
+    </div>
+  `;
+  animateCardIn();
+  renderQuestionsList();
+  document.getElementById("backToListBtn").addEventListener("click", () => { setsView = "list"; renderSetsList(); });
+  document.getElementById("cancelEditBtn").addEventListener("click", () => { setsView = "list"; renderSetsList(); });
+  document.getElementById("addQuestionBtn").addEventListener("click", () => {
+    syncDraftFromDOM();
+    draft.questions.push(blankQuestion());
+    renderQuestionsList();
+  });
+  document.getElementById("saveSetBtn").addEventListener("click", saveSet);
+}
+
+function renderQuestionsList() {
+  const list = document.getElementById("questionsList");
+  list.innerHTML = draft.questions.map((q, idx) => `
+    <div class="q-edit-card" data-idx="${idx}">
+      <div class="q-card-topbar">
+        <span class="qn-tag">QUESTION ${idx + 1}</span>
+        <div class="sc-actions">
+          <button class="icon-btn" data-move="${idx}:-1" type="button" ${idx === 0 ? "disabled" : ""}>↑</button>
+          <button class="icon-btn" data-move="${idx}:1" type="button" ${idx === draft.questions.length - 1 ? "disabled" : ""}>↓</button>
+          <button class="icon-btn danger" data-remove="${idx}" type="button">✕ Remove</button>
+        </div>
+      </div>
+      <textarea rows="2" placeholder="Question text">${esc(q.q)}</textarea>
+      ${[0, 1, 2, 3].map((i) => `
+        <div class="opt-row">
+          <input type="radio" name="correct-${idx}" value="${i}" ${q.answer === i ? "checked" : ""} title="Mark as correct answer">
+          <span class="opt-shape">${SHAPES[i].glyph}</span>
+          <input type="text" value="${escAttr(q.options[i] || "")}" placeholder="Option ${SHAPES[i].key}">
+        </div>
+      `).join("")}
+    </div>
+  `).join("");
+
+  if (window.anime) {
+    anime({ targets: ".q-edit-card", opacity: [0, 1], translateY: [8, 0], delay: anime.stagger(40), duration: 300, easing: "easeOutQuad" });
+  }
+  list.querySelectorAll("[data-remove]").forEach((b) => b.addEventListener("click", () => {
+    syncDraftFromDOM();
+    const idx = parseInt(b.dataset.remove, 10);
+    draft.questions.splice(idx, 1);
+    if (!draft.questions.length) draft.questions.push(blankQuestion());
+    renderQuestionsList();
+  }));
+  list.querySelectorAll("[data-move]").forEach((b) => b.addEventListener("click", () => {
+    syncDraftFromDOM();
+    const [idxStr, dirStr] = b.dataset.move.split(":");
+    const idx = parseInt(idxStr, 10);
+    const dir = parseInt(dirStr, 10);
+    const target = idx + dir;
+    if (target < 0 || target >= draft.questions.length) return;
+    const tmp = draft.questions[idx];
+    draft.questions[idx] = draft.questions[target];
+    draft.questions[target] = tmp;
+    renderQuestionsList();
+  }));
+}
+
+async function saveSet() {
+  syncDraftFromDOM();
+  const errorEl = document.getElementById("formError");
+  const errors = [];
+  draft.questions.forEach((q, i) => {
+    if (!q.q.trim()) errors.push(`Question ${i + 1} is missing its text.`);
+    if (!q.options.every((o) => o.trim())) errors.push(`Question ${i + 1} needs all 4 options filled in.`);
+  });
+  if (!draft.questions.length) errors.push("Add at least one question.");
+  if (errors.length) { errorEl.textContent = errors[0] + (errors.length > 1 ? ` (+${errors.length - 1} more)` : ""); return; }
+  errorEl.textContent = "";
+
+  const payload = {
+    name: draft.name,
+    seconds: draft.seconds,
+    questions: draft.questions,
+    createdAt: draft.createdAt || firebase.database.ServerValue.TIMESTAMP,
+    updatedAt: firebase.database.ServerValue.TIMESTAMP,
+  };
+  const saveStatus = document.getElementById("saveStatus");
+  saveStatus.textContent = "Saving…";
+  try {
+    if (editingSetId) {
+      await db.ref("questionSets/" + editingSetId).set(payload);
+    } else {
+      const newRef = db.ref("questionSets").push();
+      editingSetId = newRef.key;
+      draft.createdAt = payload.createdAt;
+      await newRef.set(payload);
+    }
+    saveStatus.textContent = "Saved ✓";
+    saveStatus.className = "saved-indicator";
+  } catch (e) {
+    saveStatus.textContent = "Couldn't save — check your connection.";
+    saveStatus.className = "dirty-indicator";
+  }
+}
+
+/* ============================================================
+   Dares tab
+   ============================================================ */
+
+function syncDaresFromDOM() {
+  const inputs = Array.from(document.querySelectorAll("#daresList input[type=text]"));
+  if (inputs.length) daresDraft = inputs.map((i) => i.value);
+}
+
+function renderDaresTab() {
+  card.innerHTML = `
+    <p class="eyebrow">Admin Console</p>
+    <h1 style="margin-top:0;">Last-Place Dares</h1>
+    <p class="lead">At the end of a game, the host can optionally spin one of these for whoever finished last. Keep them light and fun.</p>
+    ${tabRowHTML()}
+    <div id="daresList">
+      ${daresDraft.length ? "" : `<p class="hint" id="emptyDaresHint">No dares yet — add one below, or load the starter pack.</p>`}
+    </div>
+    <div class="new-row">
+      <input type="text" id="newDareInput" placeholder="Add a new dare…" />
+      <button class="icon-btn primary" id="addDareBtn" type="button">Add</button>
+    </div>
+    <div class="save-bar">
+      <span id="daresStatus" class="hint">${daresDraft.length} dare${daresDraft.length === 1 ? "" : "s"}</span>
+      <div class="sc-actions">
+        <button class="icon-btn" id="seedDaresBtn" type="button">Add starter pack</button>
+        <button class="icon-btn primary" id="saveDaresBtn" type="button">Save changes</button>
+      </div>
+    </div>
+  `;
+  animateCardIn();
+  bindTabRow();
+  renderDareRows();
+
+  document.getElementById("addDareBtn").addEventListener("click", () => {
+    syncDaresFromDOM();
+    const input = document.getElementById("newDareInput");
+    const val = input.value.trim();
+    if (!val) return;
+    daresDraft.push(val);
+    renderDareRows();
+    const status = document.getElementById("daresStatus");
+    status.textContent = `${daresDraft.length} dare${daresDraft.length === 1 ? "" : "s"} — unsaved`;
+    status.className = "dirty-indicator";
+  });
+  document.getElementById("newDareInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") document.getElementById("addDareBtn").click();
+  });
+  document.getElementById("seedDaresBtn").addEventListener("click", () => {
+    syncDaresFromDOM();
+    const existingLower = daresDraft.map((d) => d.toLowerCase());
+    DEFAULT_DARES.forEach((d) => { if (!existingLower.includes(d.toLowerCase())) daresDraft.push(d); });
+    renderDareRows();
+  });
+  document.getElementById("saveDaresBtn").addEventListener("click", saveDares);
+}
+
+function renderDareRows() {
+  const list = document.getElementById("daresList");
+  list.innerHTML = daresDraft.map((d, idx) => `
+    <div class="dare-row" data-idx="${idx}">
+      <input type="text" value="${escAttr(d)}" />
+      <button class="icon-btn danger" data-remove-dare="${idx}" type="button">✕</button>
+    </div>
+  `).join("") || `<p class="hint" id="emptyDaresHint">No dares yet — add one below, or load the starter pack.</p>`;
+  list.querySelectorAll("[data-remove-dare]").forEach((b) => b.addEventListener("click", () => {
+    syncDaresFromDOM();
+    daresDraft.splice(parseInt(b.dataset.removeDare, 10), 1);
+    renderDareRows();
+  }));
+  if (window.anime) {
+    anime({ targets: ".dare-row", opacity: [0, 1], translateX: [-10, 0], delay: anime.stagger(30), duration: 260, easing: "easeOutQuad" });
+  }
+}
+
+async function saveDares() {
+  syncDaresFromDOM();
+  const cleaned = daresDraft.map((d) => d.trim()).filter(Boolean);
+  daresDraft = cleaned;
+  const status = document.getElementById("daresStatus");
+  status.textContent = "Saving…";
+  try {
+    await db.ref("dares").set(cleaned);
+    status.textContent = `Saved ✓ (${cleaned.length} dare${cleaned.length === 1 ? "" : "s"})`;
+    status.className = "saved-indicator";
+    renderDareRows();
+  } catch (e) {
+    status.textContent = "Couldn't save — check your connection.";
+    status.className = "dirty-indicator";
+  }
+}
+
+init();
+</script>
+
+</body>
+</html>
