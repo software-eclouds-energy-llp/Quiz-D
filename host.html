@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Host — AI &amp; LLM Live Quiz</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="bg-orb orb1"></div>
+<div class="bg-orb orb2"></div>
+
+<div class="wrap">
+  <div class="card" id="card">
+    <div class="center-msg"><span class="big-emoji">📡</span>Connecting…</div>
+  </div>
+  <div class="foot-note" id="footnote">Host console</div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="firebase-init.js"></script>
+<script src="questions.js"></script>
+<script>
+const SHAPES = [
+  { key: "A", cls: "shape-a", glyph: "▲" },
+  { key: "B", cls: "shape-b", glyph: "◆" },
+  { key: "C", cls: "shape-c", glyph: "●" },
+  { key: "D", cls: "shape-d", glyph: "■" },
+];
+
+const card = document.getElementById("card");
+const footnote = document.getElementById("footnote");
+
+let roomCode = null;
+let roomRef = null;
+let playersRef = null;
+let answersRef = null;
+let playersCache = {};
+let countdownTimer = null;
+let currentRoomState = null; // mirrors last known room snapshot
+
+function esc(str) {
+  const d = document.createElement("div");
+  d.textContent = String(str);
+  return d.innerHTML;
+}
+
+function genCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O or 1/I
+  let out = "";
+  for (let i = 0; i < 4; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+function sortedPlayers() {
+  return Object.entries(playersCache)
+    .map(([id, p]) => ({ id, name: p.name || "Player", score: p.score || 0 }))
+    .sort((a, b) => b.score - a.score);
+}
+
+function leaderboardTableHTML(list, limit) {
+  const top = limit ? list.slice(0, limit) : list;
+  if (!top.length) return `<p class="hint">No players have scored yet.</p>`;
+  const rankClass = (i) => (i === 0 ? "gold" : i === 1 ? "silver" : i === 2 ? "bronze" : "");
+  return `
+    <table class="leaderboard">
+      <thead><tr><th>Player</th><th>Score</th></tr></thead>
+      <tbody>
+        ${top.map((p, i) => `
+          <tr>
+            <td><span class="rank ${rankClass(i)}">${i + 1}</span>${esc(p.name)}</td>
+            <td>${p.score}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+/* ---------- Setup: create the room ---------- */
+
+async function createRoom() {
+  roomCode = genCode();
+  roomRef = db.ref("rooms/" + roomCode);
+  playersRef = roomRef.child("players");
+  answersRef = roomRef.child("answers");
+
+  await roomRef.set({
+    status: "lobby",
+    qIndex: -1,
+    total: QUESTIONS.length,
+    createdAt: firebase.database.ServerValue.TIMESTAMP,
+  });
+
+  roomRef.onDisconnect().update({ hostLeft: true });
+
+  playersRef.on("value", (snap) => {
+    playersCache = snap.val() || {};
+    if (currentRoomState && currentRoomState.status === "lobby") renderLobby();
+  });
+
+  roomRef.on("value", (snap) => {
+    const val = snap.val();
+    if (!val) return;
+    const prev = currentRoomState;
+    currentRoomState = val;
+    // React to status transitions driven elsewhere only if needed later.
+    if (!prev) renderLobby();
+  });
+}
+
+/* ---------- Screens ---------- */
+
+function renderLobby() {
+  footnote.textContent = "Room " + roomCode + " · Lobby";
+  const players = sortedPlayers();
+  card.innerHTML = `
+    <span class="on-air"><span class="dot"></span>Room open</span>
+    <p class="eyebrow" style="margin-top:14px;">Everyone joins with this code</p>
+    <div class="room-code">${roomCode}</div>
+    <p class="hint" style="text-align:center;">On player.html, enter this code and a name to join.</p>
+
+    <div class="q-header" style="margin-top:24px;">
+      <span class="player-count-label">${players.length} player${players.length === 1 ? "" : "s"} joined</span>
+    </div>
+    <div class="player-chip-grid" id="chipGrid">
+      ${players.map(p => `<span class="player-chip">${esc(p.name)}</span>`).join("") || `<span class="hint">Waiting for players…</span>`}
+    </div>
+
+    <button class="btn btn-primary" id="startBtn" ${players.length ? "" : "disabled"}>
+      Start Game ${players.length ? `(${players.length} ready)` : ""}
+    </button>
+    <p class="hint">${QUESTIONS.length} questions · ${QUESTION_SECONDS}s each · faster correct answers score more</p>
+  `;
+  const startBtn = document.getElementById("startBtn");
+  if (startBtn) startBtn.addEventListener("click", startGame);
+}
+
+async function startGame() {
+  await roomRef.update({ qIndex: 0 });
+  await goToQuestion(0);
+}
+
+async function goToQuestion(idx) {
+  clearInterval(countdownTimer);
+  await roomRef.update({
+    status: "question",
+    qIndex: idx,
+    qStartedAt: firebase.database.ServerValue.TIMESTAMP,
+  });
+  // Read back the resolved server timestamp so the host's own countdown is accurate.
+  const snap = await roomRef.child("qStartedAt").once("value");
+  const startedAt = snap.val() || Date.now();
+  renderQuestionLive(idx, startedAt);
+}
+
+function renderQuestionLive(idx, startedAt) {
+  const item = QUESTIONS[idx];
+  const total = QUESTIONS.length;
+  footnote.textContent = `Room ${roomCode} · Question ${idx + 1} of ${total}`;
+
+  card.innerHTML = `
+    <div class="q-header">
+      <span class="q-progress-label">QUESTION ${idx + 1} OF ${total}</span>
+      <div class="timer-ring-wrap">
+        <svg width="64" height="64" viewBox="0 0 64 64">
+          <circle class="timer-ring-track" cx="32" cy="32" r="27"></circle>
+          <circle class="timer-ring-fill" id="ringFill" cx="32" cy="32" r="27"
+            stroke-dasharray="${2 * Math.PI * 27}" stroke-dashoffset="0"></circle>
+        </svg>
+        <div class="timer-ring-num" id="ringNum">${QUESTION_SECONDS}</div>
+      </div>
+    </div>
+    <p class="question-text">${esc(item.q)}</p>
+    <div class="vote-rows" id="voteRows">
+      ${item.options.map((opt, i) => voteRowHTML(SHAPES[i], opt, 0, 0, false)).join("")}
+    </div>
+    <p class="hint" id="liveCount" style="text-align:center;margin-top:16px;">0 answers in…</p>
+    <button class="btn btn-primary" id="revealBtn">Reveal Answer Now</button>
+  `;
+  document.getElementById("revealBtn").addEventListener("click", () => revealAnswer(idx));
+
+  const circumference = 2 * Math.PI * 27;
+  const ringFill = document.getElementById("ringFill");
+  const ringNum = document.getElementById("ringNum");
+
+  countdownTimer = setInterval(() => {
+    const elapsed = (Date.now() - startedAt) / 1000;
+    const remaining = Math.max(0, QUESTION_SECONDS - elapsed);
+    const ratio = remaining / QUESTION_SECONDS;
+    ringFill.setAttribute("stroke-dashoffset", String(circumference * (1 - ratio)));
+    ringFill.style.stroke = remaining <= 5 ? "var(--wrong)" : "var(--mint)";
+    ringNum.textContent = Math.ceil(remaining);
+    if (remaining <= 0) {
+      clearInterval(countdownTimer);
+      revealAnswer(idx);
+    }
+  }, 200);
+
+  answersRef.child(idx).on("value", (snap) => {
+    const answers = snap.val() || {};
+    const counts = [0, 0, 0, 0];
+    Object.values(answers).forEach((a) => {
+      if (a && typeof a.choice === "number") counts[a.choice] = (counts[a.choice] || 0) + 1;
+    });
+    updateVoteRows(counts, null);
+    const liveCountEl = document.getElementById("liveCount");
+    if (liveCountEl) {
+      const n = Object.keys(answers).length;
+      liveCountEl.textContent = `${n} answer${n === 1 ? "" : "s"} in…`;
+    }
+  });
+}
+
+function voteRowHTML(shape, optText, count, total, revealMode, isCorrect) {
+  const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+  return `
+    <div class="vote-row ${revealMode && isCorrect ? "correct-row" : ""}" data-shape="${shape.key}">
+      <span class="glyph ${shape.cls}">${shape.glyph}</span>
+      <div class="bar-track">
+        <div class="bar-fill ${shape.cls}" style="width:${pct}%;" data-count="${count}"></div>
+        <span class="bar-label">${esc(optText)}${revealMode && isCorrect ? " ✓" : ""}</span>
+      </div>
+      <span class="bar-count">${count}</span>
+    </div>`;
+}
+
+function updateVoteRows(counts, correctIdx) {
+  const rows = document.querySelectorAll("#voteRows .vote-row, #revealRows .vote-row");
+  const total = counts.reduce((a, b) => a + b, 0);
+  rows.forEach((row, i) => {
+    const fill = row.querySelector(".bar-fill");
+    const countEl = row.querySelector(".bar-count");
+    const pct = total > 0 ? Math.round((counts[i] / total) * 100) : 0;
+    if (fill) fill.style.width = pct + "%";
+    if (countEl) countEl.textContent = counts[i];
+    if (correctIdx !== null) row.classList.toggle("correct-row", i === correctIdx);
+  });
+}
+
+async function revealAnswer(idx) {
+  clearInterval(countdownTimer);
+  answersRef.child(idx).off();
+  await roomRef.update({ status: "reveal" });
+
+  const item = QUESTIONS[idx];
+  const snap = await answersRef.child(idx).once("value");
+  const answers = snap.val() || {};
+  const counts = [0, 0, 0, 0];
+  Object.values(answers).forEach((a) => {
+    if (a && typeof a.choice === "number") counts[a.choice] = (counts[a.choice] || 0) + 1;
+  });
+  const total = QUESTIONS.length;
+  const isLast = idx === total - 1;
+
+  footnote.textContent = `Room ${roomCode} · Answer revealed`;
+  card.innerHTML = `
+    <p class="eyebrow">Answer Revealed</p>
+    <p class="question-text">${esc(item.q)}</p>
+    <div class="vote-rows" id="revealRows">
+      ${item.options.map((opt, i) => voteRowHTML(SHAPES[i], opt, counts[i], total, true, i === item.answer)).join("")}
+    </div>
+    <h2 style="margin-top:28px;">Leaderboard so far</h2>
+    ${leaderboardTableHTML(sortedPlayers(), 5)}
+    <button class="btn btn-primary" id="nextBtn">${isLast ? "Show Final Results" : "Next Question"}</button>
+  `;
+  document.getElementById("nextBtn").addEventListener("click", () => {
+    if (isLast) renderFinal();
+    else goToQuestion(idx + 1);
+  });
+}
+
+async function renderFinal() {
+  await roomRef.update({ status: "final" });
+  footnote.textContent = `Room ${roomCode} · Final results`;
+  const list = sortedPlayers();
+  card.innerHTML = `
+    <p class="eyebrow">Game Over</p>
+    <h1>Final Leaderboard</h1>
+    ${leaderboardTableHTML(list)}
+    <button class="btn btn-ghost" style="margin-top:20px;width:100%;" id="newGameBtn">Start a New Game</button>
+  `;
+  document.getElementById("newGameBtn").addEventListener("click", () => location.reload());
+  if (list.length) launchConfetti();
+}
+
+function launchConfetti() {
+  const colors = ["#FF6B57", "#F2C94C", "#7B61FF", "#02C39A", "#028090"];
+  for (let i = 0; i < 60; i++) {
+    const el = document.createElement("div");
+    el.className = "confetti-piece";
+    el.style.left = Math.random() * 100 + "vw";
+    el.style.background = colors[Math.floor(Math.random() * colors.length)];
+    el.style.animationDuration = 2.5 + Math.random() * 1.8 + "s";
+    el.style.animationDelay = Math.random() * 0.6 + "s";
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 5200);
+  }
+}
+
+createRoom().catch((e) => {
+  console.error(e);
+  card.innerHTML = `<div class="center-msg"><span class="big-emoji">⚠️</span>Couldn't connect to the live database.<br>Check firebase-init.js has your real project config.</div>`;
+});
+</script>
+
+</body>
+</html>
