@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="format-detection" content="telephone=no, email=no, address=no, date=no">
+<meta name="theme-color" content="#013E44">
+<title>AI &amp; LLM Live Quiz</title>
+<link rel="stylesheet" href="style.css">
+<script src="webview-fit.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.14.1/cdn.min.js"></script>
+</head>
+<body>
+
+<div class="bg-orb orb1"></div>
+<div class="bg-orb orb2"></div>
+
+<div class="wrap">
+  <div class="card" x-data="{ show: false }" x-init="setTimeout(() => show = true, 30)"
+       x-show="show" x-transition:enter="rise-enter" x-transition:enter-start="rise-enter-start" x-transition:enter-end="rise-enter-end">
+    <span class="on-air"><span class="dot"></span>Live game</span>
+    <h1 style="margin-top:14px;">AI &amp; LLM Knowledge Check</h1>
+    <p class="lead">Play together, in real time. One person hosts on the big screen, everyone else joins from their phone with a room code. Every question is timed, votes come in live, and the leaderboard updates the instant answers land.</p>
+
+    <div class="btn-row" style="margin-top:4px;">
+      <button class="btn btn-primary" style="margin-top:0;" onclick="location.href='host.html'">Host a Game</button>
+      <button class="btn btn-ghost" onclick="location.href='player.html'" style="border-radius:10px;">Join a Game</button>
+    </div>
+    <p class="hint">Hosting? Open host.html on the screen everyone can see. Joining? Grab the room code from the host and open player.html on your own device.</p>
+    <p class="hint" style="margin-top:14px;"><a href="admin.html" style="color:var(--teal);font-weight:700;">⚙️ Manage quiz questions &amp; dares</a></p>
+  </div>
+  <div class="foot-note">Understanding LLMs &amp; AI — Live Multiplayer Edition</div>
+</div>
+
+<style>
+  .rise-enter { transition: opacity 0.4s ease, transform 0.4s ease; }
+  .rise-enter-start { opacity: 0; transform: translateY(14px); }
+  .rise-enter-end { opacity: 1; transform: translateY(0); }
+</style>
+
+</body>
+</html>
