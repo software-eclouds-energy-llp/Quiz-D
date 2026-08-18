@@ -63,6 +63,44 @@ let feedbackShown = false; // guards against showing feedback twice (instant loc
 let localTimer = null;
 let myScore = 0;
 let streak = 0; // fun element: consecutive correct answers
+let liveCountRef = null; // Firebase listener on this question's answers (live count on feedback screen)
+let scoresListenerRef = null; // live standings listener on the feedback screen
+let reactionsRef = null; // per-room emoji reactions feed
+let feedbackTimer = null; // countdown interval on feedback screen
+let myPrevRank = null; // my rank after the previous question, for the "you moved up" delta
+let rankSettledForQ = -1; // question index whose rank delta has been locked in
+const _prefilledCode = (new URLSearchParams(location.search).get("code") || "").replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 4);
+
+/* ---------- Sound effects (Web Audio, no library) ---------- */
+// AudioContext must be created/resumed from a user gesture, so we lazy-init on
+// the first join tap. All effects are synthesized — no audio files to ship.
+let _audioCtx = null;
+let soundOn = true;
+function initAudio() {
+  if (_audioCtx) { if (_audioCtx.state === "suspended") _audioCtx.resume(); return; }
+  try { _audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { _audioCtx = null; }
+}
+// Play a tone: freq(s) can be a single Hz or [from,to] for a glide.
+function tone(freq, dur, type = "sine", gain = 0.15) {
+  if (!soundOn || !_audioCtx) return;
+  const t0 = _audioCtx.currentTime;
+  const osc = _audioCtx.createOscillator();
+  const g = _audioCtx.createGain();
+  osc.type = type;
+  if (Array.isArray(freq)) {
+    osc.frequency.setValueAtTime(freq[0], t0);
+    osc.frequency.exponentialRampToValueAtTime(freq[1], t0 + dur);
+  } else {
+    osc.frequency.setValueAtTime(freq, t0);
+  }
+  g.gain.setValueAtTime(gain, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g); g.connect(_audioCtx.destination);
+  osc.start(t0); osc.stop(t0 + dur);
+}
+function playCorrect() { tone([660, 990], 0.18, "sine", 0.18); setTimeout(() => tone(1320, 0.16, "sine", 0.14), 90); }
+function playWrong() { tone([300, 120], 0.32, "sawtooth", 0.16); }
+function playBeep() { tone(880, 0.08, "square", 0.10); }
 
 // Questions + timing come from the room itself now (the host picks the quiz
 // set on their setup screen and embeds it in the room), not a local file —
@@ -125,7 +163,7 @@ function animatePodium(n) {
 function renderJoin(errorMsg) {
   footnote.textContent = "Join a live game";
   card.innerHTML = `
-    <div x-data="{ code: '', name: '' }">
+    <div x-data="{ code: '${_prefilledCode}', name: '' }">
       <span class="on-air"><span class="dot"></span>Live game</span>
       <h1 style="margin-top:14px;">Join the Quiz</h1>
       <p class="lead">Enter the room code from the host's screen and pick a name.</p>
@@ -145,11 +183,11 @@ function renderJoin(errorMsg) {
   const codeInput = document.getElementById("codeInput");
   const nameInput = document.getElementById("nameInput");
   const joinBtn = document.getElementById("joinBtn");
-  codeInput.focus();
+  if (codeInput.value.length === 4) nameInput.focus(); else codeInput.focus();
   [codeInput, nameInput].forEach((el) => {
     el.addEventListener("keydown", (e) => { if (e.key === "Enter" && !joinBtn.disabled) joinBtn.click(); });
   });
-  joinBtn.addEventListener("click", () => attemptJoin(codeInput.value, nameInput.value));
+  joinBtn.addEventListener("click", () => { initAudio(); attemptJoin(codeInput.value, nameInput.value); });
 }
 
 async function attemptJoin(codeRaw, nameRaw) {
@@ -173,6 +211,7 @@ async function attemptJoin(codeRaw, nameRaw) {
   roomRef = candidateRoomRef;
   playersRef = roomRef.child("players");
   answersRef = roomRef.child("answers");
+  reactionsRef = roomRef.child("reactions");
   myName = name;
   quizQuestions = Array.isArray(room.questions) ? room.questions : [];
   quizSeconds = room.questionSeconds || 20;
@@ -258,6 +297,8 @@ function renderWaiting() {
 
 function renderQuestion(idx, startedAt) {
   clearInterval(localTimer);
+  clearInterval(feedbackTimer);
+  stopFeedbackListeners();
   const item = quizQuestions[idx];
   const total = quizQuestions.length;
   if (!item) return; // questions haven't synced yet — next snapshot will retry
@@ -276,6 +317,7 @@ function renderQuestion(idx, startedAt) {
       </div>
     </div>
     <p class="question-text">${esc(item.q)}</p>
+    ${item.img ? `<img class="q-img" src="${esc(item.img)}" alt="">` : ""}
     <div class="shape-grid" id="shapeGrid">
       ${item.options.map((opt, i) => `
         <button class="shape-btn ${SHAPES[i].cls}" data-i="${i}">
@@ -311,9 +353,10 @@ function renderQuestion(idx, startedAt) {
     }
     const secondsLeft = Math.ceil(remaining);
     if (ringNum) ringNum.textContent = secondsLeft;
-    if (remaining <= 5 && remaining > 0 && secondsLeft !== lastPulseSecond && window.anime) {
+    if (remaining <= 5 && remaining > 0 && secondsLeft !== lastPulseSecond) {
       lastPulseSecond = secondsLeft;
-      anime({ targets: "#ringNum", scale: [1, 1.3, 1], duration: 420, easing: "easeInOutSine" });
+      if (!hasAnsweredThisQ) playBeep();
+      if (window.anime) anime({ targets: "#ringNum", scale: [1, 1.3, 1], duration: 420, easing: "easeInOutSine" });
     }
     if (remaining <= 0) {
       clearInterval(localTimer);
@@ -331,8 +374,10 @@ function submitAnswer(idx, choice, startedAt, buttons, chosenBtn) {
   const correct = choice === item.answer;
   const elapsedMs = Date.now() - startedAt;
   const remainingRatio = Math.max(0, Math.min(1, 1 - elapsedMs / (quizSeconds * 1000)));
-  const points = correct ? Math.round(500 + 500 * remainingRatio) : 0;
+  let points = correct ? Math.round(500 + 500 * remainingRatio) : 0;
   streak = correct ? streak + 1 : 0;
+  const streakBonus = correct && streak >= 3 ? 100 : 0; // reward hot streaks
+  points += streakBonus;
 
   buttons.forEach((b) => { b.disabled = true; if (b !== chosenBtn) b.classList.add("dimmed"); });
   if (window.anime) {
@@ -354,7 +399,7 @@ function submitAnswer(idx, choice, startedAt, buttons, chosenBtn) {
   // since the correct answer ships to every client up front with the room's
   // question data. A short pause just lets the tap animation above finish
   // before the screen swaps to the result.
-  setTimeout(() => paintFeedback(idx, { choice, correct, points }), 350);
+  setTimeout(() => paintFeedback(idx, { choice, correct, points, streakBonus }), 350);
 }
 
 function lockInTimeout(idx, buttons) {
@@ -383,22 +428,40 @@ function paintFeedback(idx, mine) {
   const item = quizQuestions[idx];
   const correct = !!(mine && mine.correct);
   const points = mine ? mine.points : 0;
-  const streakBadge = correct && streak >= 2 ? `<div class="streak-badge">🔥 ${streak} in a row!</div>` : "";
+  const bonus = mine && mine.streakBonus ? mine.streakBonus : 0;
+  const streakBadge = bonus
+    ? `<div class="streak-badge bonus">🔥 ${streak} streak · +${bonus} bonus!</div>`
+    : (correct && streak >= 2 ? `<div class="streak-badge">🔥 ${streak} in a row!</div>` : "");
 
   card.innerHTML = `
+    <div class="reaction-stage" id="reactionStage"></div>
     <div class="feedback-hero ${correct ? "is-correct" : "is-wrong"}">
       <div class="glyph-big" id="feedbackGlyph">${correct ? "✓" : "✕"}</div>
       <p class="fh-title">${correct ? "Correct!" : (mine && mine.choice === null ? "Time's up" : "Not quite")}</p>
       <p class="fh-sub">${esc(item.options[item.answer])}</p>
       <p class="fh-points">${correct ? "+" + points + " points" : "+0 points"}</p>
       ${streakBadge}
+      <div id="rankDelta"></div>
     </div>
     <div class="q-header" style="justify-content:center;">
       <span class="player-count-label">Your total score: <span id="myScoreReadout">${myScore}</span></span>
     </div>
-    <p class="hint" style="text-align:center;">Waiting for the host to move to the next question…</p>
+    <p class="hint" style="text-align:center;"><span id="liveAnswered">…</span> answered</p>
+    <p class="hint" id="qCountdown" style="text-align:center;font-weight:800;"></p>
+
+    <span class="player-count-label standings-label">Live standings</span>
+    <div id="miniBoard"></div>
+
+    <div class="reaction-bar" id="reactionBar">
+      <button class="reaction-btn" data-emoji="🔥" type="button" aria-label="React fire">🔥</button>
+      <button class="reaction-btn" data-emoji="😅" type="button" aria-label="React nervous">😅</button>
+      <button class="reaction-btn" data-emoji="🤔" type="button" aria-label="React thinking">🤔</button>
+    </div>
   `;
   animateCardIn();
+  wireReactions();
+  if (correct) playCorrect(); else playWrong();
+  startFeedbackLive(idx);
   if (window.anime) {
     anime({
       targets: "#feedbackGlyph",
@@ -411,6 +474,128 @@ function paintFeedback(idx, mine) {
       anime({ targets: ".streak-badge", scale: [0, 1], opacity: [0, 1], duration: 420, delay: 200, easing: "easeOutBack" });
     }
   }
+}
+
+// Detach every feedback-screen Firebase listener when leaving that screen.
+function stopFeedbackListeners() {
+  if (liveCountRef) { liveCountRef.off(); liveCountRef = null; }
+  if (scoresListenerRef) { scoresListenerRef.off(); scoresListenerRef = null; }
+  if (reactionsRef) reactionsRef.off("child_added");
+}
+
+// Live answer count + countdown to question end, shown after this player
+// answered so they don't stare at a dead "waiting" screen.
+function startFeedbackLive(idx) {
+  const answeredEl = () => document.getElementById("liveAnswered");
+  const cdEl = () => document.getElementById("qCountdown");
+
+  let total = 0;
+  playersRef.once("value").then((s) => { total = s.numChildren(); }).catch(() => {});
+
+  if (liveCountRef) liveCountRef.off();
+  liveCountRef = answersRef.child(idx);
+  liveCountRef.on("value", (snap) => {
+    const el = answeredEl();
+    if (el) el.textContent = total ? `${snap.numChildren()} / ${total}` : snap.numChildren();
+  });
+
+  // Live standings + rank movement — updates as the rest of the room answers.
+  if (scoresListenerRef) scoresListenerRef.off();
+  scoresListenerRef = playersRef;
+  scoresListenerRef.on("value", (snap) => {
+    const players = snap.val() || {};
+    const list = Object.entries(players)
+      .map(([id, p]) => ({ id, name: p.name || "Player", score: p.score || 0 }))
+      .sort((a, b) => b.score - a.score);
+    total = list.length;
+    renderMiniBoard(list);
+    renderRankDelta(list, idx);
+  });
+
+  clearInterval(feedbackTimer);
+  const endAt = (qStartedAtLocal || Date.now()) + quizSeconds * 1000;
+  const tick = () => {
+    const el = cdEl();
+    if (!el) return;
+    const left = Math.ceil((endAt - Date.now()) / 1000);
+    el.textContent = left > 0 ? `Next question in ${left}s` : "Wrapping up…";
+    if (left <= 0) clearInterval(feedbackTimer);
+  };
+  tick();
+  feedbackTimer = setInterval(tick, 250);
+}
+
+// Top 5 standings, my own row highlighted — reuses the final-screen table.
+function renderMiniBoard(list) {
+  const el = document.getElementById("miniBoard");
+  if (!el) return;
+  const top = list.slice(0, 5);
+  const rankClass = (i) => (i === 0 ? "gold" : i === 1 ? "silver" : i === 2 ? "bronze" : "");
+  el.innerHTML = `
+    <table class="leaderboard">
+      <tbody>
+        ${top.map((p, i) => `
+          <tr class="${p.id === playerId ? "me" : ""}">
+            <td><span class="rank ${rankClass(i)}">${i + 1}</span>${esc(p.name)}</td>
+            <td>${p.score}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+// "Up to #3" / "Down to #7" / "Holding #4" vs where I stood last question.
+function renderRankDelta(list, idx) {
+  const el = document.getElementById("rankDelta");
+  if (!el) return;
+  const myIdx = list.findIndex((p) => p.id === playerId);
+  if (myIdx < 0) return;
+  const rank = myIdx + 1;
+  let cls = "same", arrow = "＝", label = `Holding #${rank}`;
+  if (myPrevRank == null) { label = `You're #${rank}`; }
+  else if (rank < myPrevRank) { cls = "up"; arrow = "▲"; label = `Up to #${rank}`; }
+  else if (rank > myPrevRank) { cls = "down"; arrow = "▼"; label = `Down to #${rank}`; }
+  el.innerHTML = `<span class="rank-delta ${cls}"><span class="rd-arrow">${arrow}</span>${label}</span>`;
+  // Settle this question's rank once the timer's run out, so next question's
+  // delta compares against a final standing rather than a mid-answer one.
+  if (Date.now() > (qStartedAtLocal || 0) + quizSeconds * 1000 && rankSettledForQ !== idx) {
+    myPrevRank = rank;
+    rankSettledForQ = idx;
+  }
+}
+
+// Wire the emoji buttons + start listening for everyone's reactions.
+function wireReactions() {
+  const bar = document.getElementById("reactionBar");
+  if (bar) {
+    bar.querySelectorAll(".reaction-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (!reactionsRef) return;
+        reactionsRef.push({ emoji: btn.dataset.emoji, by: playerId, ts: firebase.database.ServerValue.TIMESTAMP });
+        spawnEmoji(btn.dataset.emoji); // instant local feedback
+      });
+    });
+  }
+  // Only show reactions sent from now on, so joining mid-game doesn't replay old ones.
+  if (reactionsRef) {
+    reactionsRef.off("child_added");
+    const since = Date.now();
+    reactionsRef.orderByChild("ts").startAt(since).on("child_added", (snap) => {
+      const r = snap.val();
+      if (r && r.emoji && r.by !== playerId) spawnEmoji(r.emoji); // own reaction already shown locally
+    });
+  }
+}
+
+// ponytail: reactions are tiny + host clears the room at game end; no pruning.
+function spawnEmoji(emoji) {
+  const stage = document.getElementById("reactionStage");
+  if (!stage) return;
+  const span = document.createElement("span");
+  span.className = "floating-emoji";
+  span.textContent = emoji;
+  span.style.left = (12 + Math.random() * 66) + "%";
+  stage.appendChild(span);
+  setTimeout(() => span.remove(), 2300);
 }
 
 // Fallback only — fires if the room reaches "reveal" before this client
@@ -431,6 +616,8 @@ async function renderFeedback(idx) {
 
 async function renderFinal() {
   clearInterval(localTimer);
+  clearInterval(feedbackTimer);
+  stopFeedbackListeners();
   footnote.textContent = `Room ${roomCode} · Final results`;
   let list = [];
   try {

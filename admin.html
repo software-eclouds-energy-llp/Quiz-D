@@ -68,8 +68,53 @@ function escAttr(str) {
 function animateCardIn() {
   if (window.anime) anime({ targets: "#card", opacity: [0, 1], translateY: [12, 0], duration: 380, easing: "easeOutQuad" });
 }
-function blankQuestion() { return { q: "", options: ["", "", "", ""], answer: 0 }; }
+function blankQuestion() { return { q: "", options: ["", "", "", ""], answer: 0, img: "" }; }
 function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
+
+// Parse one CSV row respecting double-quoted fields (handles commas + "" escapes).
+function parseCSVRow(line) {
+  const out = [];
+  let cur = "", inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else inQ = false; }
+      else cur += ch;
+    } else if (ch === '"') inQ = true;
+    else if (ch === ",") { out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out.map((s) => s.trim());
+}
+
+// CSV columns: question, optA, optB, optC, optD, correct(1-4), image(optional).
+// A header row (first cell "question"/"q") is skipped. Returns question objects.
+function parseCSVQuestions(csv) {
+  const lines = csv.split(/\r?\n/).filter((l) => l.trim());
+  if (!lines.length) return [];
+  const first = parseCSVRow(lines[0])[0].toLowerCase();
+  if (first === "question" || first === "q") lines.shift();
+  return lines.map((line) => {
+    const f = parseCSVRow(line);
+    const options = [f[1] || "", f[2] || "", f[3] || "", f[4] || ""];
+    let answer = parseInt(f[5], 10);
+    answer = isNaN(answer) ? 0 : Math.min(3, Math.max(0, answer - 1)); // 1-based → 0-based
+    return { q: f[0] || "", options, answer, img: f[6] || "" };
+  }).filter((q) => q.q);
+}
+
+// JSON import accepts either an array of questions or a {name,seconds,questions} set.
+function parseJSONQuestions(text) {
+  const data = JSON.parse(text);
+  const arr = Array.isArray(data) ? data : (data.questions || []);
+  return arr.map((q) => ({
+    q: q.q || q.question || "",
+    options: (q.options || []).slice(0, 4).concat(["", "", "", ""]).slice(0, 4),
+    answer: Math.min(3, Math.max(0, parseInt(q.answer, 10) || 0)),
+    img: q.img || "",
+  })).filter((q) => q.q);
+}
 
 /* ---------- Global state ---------- */
 let currentTab = "sets";       // "sets" | "dares" | "history"
@@ -147,7 +192,10 @@ function renderSetsList() {
     <div class="sc-actions" style="margin-bottom:16px;">
       <button class="icon-btn primary" id="newSetBtn">＋ New blank set</button>
       <button class="icon-btn" id="seedDefaultBtn">Start from the default AI &amp; LLM quiz</button>
+      <button class="icon-btn" id="importBtn">⭱ Import JSON / CSV</button>
+      <input type="file" id="importFile" accept=".json,.csv,text/csv,application/json" style="display:none;">
     </div>
+    <p class="hint" style="margin:-8px 0 16px;">CSV columns: question, A, B, C, D, correct(1–4), image(optional)</p>
     <div id="setsList">
       ${entries.length ? entries.map(([id, s]) => `
         <div class="set-card-row">
@@ -172,6 +220,26 @@ function renderSetsList() {
     seconds: DEFAULT_QUESTION_SECONDS,
     questions: clone(DEFAULT_QUESTIONS),
   }));
+  const importFile = document.getElementById("importFile");
+  document.getElementById("importBtn").addEventListener("click", () => importFile.click());
+  importFile.addEventListener("change", () => {
+    const file = importFile.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let questions = [];
+      try {
+        questions = /\.json$/i.test(file.name) ? parseJSONQuestions(reader.result) : parseCSVQuestions(reader.result);
+      } catch (e) {
+        alert("Couldn't parse that file: " + e.message);
+        return;
+      }
+      if (!questions.length) { alert("No questions found in that file."); return; }
+      openEditor(null, { name: file.name.replace(/\.[^.]+$/, ""), seconds: 20, questions });
+    };
+    reader.readAsText(file);
+    importFile.value = "";
+  });
   card.querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", () => {
     const id = b.dataset.edit;
     openEditor(id, clone(setsCache[id]));
@@ -227,7 +295,9 @@ function syncDraftFromDOM() {
       const opts = Array.from(c.querySelectorAll(".opt-row input[type=text]")).map((i) => i.value);
       const checked = c.querySelector(".opt-row input[type=radio]:checked");
       const answer = checked ? parseInt(checked.value, 10) : 0;
-      return { q: qText, options: opts, answer };
+      const imgEl = c.querySelector(".img-url-input");
+      const img = imgEl ? imgEl.value.trim() : "";
+      return { q: qText, options: opts, answer, img };
     });
   }
 }
@@ -275,6 +345,7 @@ function renderQuestionsList() {
         </div>
       </div>
       <textarea rows="2" placeholder="Question text">${esc(q.q)}</textarea>
+      <input type="text" class="img-url-input" value="${escAttr(q.img || "")}" placeholder="Image URL (optional)" style="margin-bottom:8px;">
       ${[0, 1, 2, 3].map((i) => `
         <div class="opt-row">
           <input type="radio" name="correct-${idx}" value="${i}" ${q.answer === i ? "checked" : ""} title="Mark as correct answer">
@@ -530,6 +601,36 @@ async function deleteHistoryRoom(code) {
   }
 }
 
+function csvCell(v) {
+  const s = String(v == null ? "" : v);
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// One row per player: rank, name, total, correct-count, then points per question.
+function exportGameCSV(code, room) {
+  const list = historySortedPlayers(room);
+  const questions = Array.isArray(room.questions) ? room.questions : [];
+  const header = ["Rank", "Player", "Total Score", "Correct"].concat(questions.map((_, i) => "Q" + (i + 1) + " pts"));
+  const rows = [header];
+  list.forEach((p, i) => {
+    let correct = 0;
+    const perQ = questions.map((_, qi) => {
+      const a = room.answers && room.answers[qi] && room.answers[qi][p.id];
+      if (a && a.correct) correct++;
+      return a ? (a.points || 0) : "";
+    });
+    rows.push([i + 1, p.name, p.score, correct].concat(perQ));
+  });
+  const csv = rows.map((r) => r.map(csvCell).join(",")).join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "quiz-" + code + "-results.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function historySortedPlayers(room) {
   const players = room.players || {};
   return Object.entries(players)
@@ -564,7 +665,7 @@ function historyVoteRowHTML(shape, optText, count, total, isCorrect, names) {
     <div class="vote-row ${isCorrect ? "correct-row" : ""}" data-shape="${shape.key}">
       <span class="glyph ${shape.cls}">${shape.glyph}</span>
       <div class="bar-track">
-        <div class="bar-fill ${shape.cls}" style="width:${pct}%;" data-count="${count}"></div>
+        <div class="bar-fill ${shape.cls}" style="transform:scaleX(${pct/100});" data-count="${count}"></div>
         <span class="bar-label">${esc(optText)}${isCorrect ? " ✓" : ""}</span>
       </div>
       <span class="bar-count">${count}</span>
@@ -646,10 +747,12 @@ function renderHistoryDetail(code) {
         ? questions.map((_, i) => historyQuestionHTML(room, i)).join("")
         : `<p class="hint">This game never reached any questions.</p>`}
 
+      <button class="btn btn-primary" id="exportCsvBtn" style="width:100%;margin-top:10px;">⭳ Export results as CSV</button>
       <button class="btn btn-ghost" id="deleteThisGameBtn" style="width:100%;margin-top:10px;">Delete This Game Record</button>
     `;
     animateCardIn();
     document.getElementById("backToHistoryBtn").addEventListener("click", () => renderHistoryList());
+    document.getElementById("exportCsvBtn").addEventListener("click", () => exportGameCSV(code, room));
     document.getElementById("deleteThisGameBtn").addEventListener("click", async () => {
       if (!confirm(`Delete the game record for room ${code}? This can't be undone.`)) return;
       try {

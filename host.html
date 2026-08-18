@@ -46,6 +46,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.2/anime.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" integrity="sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU" crossorigin="anonymous"></script>
 <script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.14.1/cdn.min.js"></script>
 <script src="firebase-init.js"></script>
 <script src="questions.js"></script>
@@ -122,6 +123,11 @@ function animateCardIn() {
       easing: "easeOutQuad",
     });
   }
+}
+
+function playerJoinURL(code) {
+  const base = location.href.replace(/host\.html.*$/, "player.html");
+  return base + "?code=" + encodeURIComponent(code);
 }
 
 function genCode() {
@@ -369,7 +375,8 @@ function renderLobby() {
     <p class="eyebrow" style="margin-top:14px;">${esc(currentQuizName)}</p>
     <div class="room-code" id="roomCodeEl" title="Tap to copy">${roomCode}</div>
     <p class="room-code-copy-hint">Tap the code to copy it</p>
-    <p class="hint" style="text-align:center;">On player.html, enter this code and a name to join.</p>
+    <div class="qr-wrap"><div id="qrBox"></div><span class="qr-hint">Scan to join instantly</span></div>
+    <p class="hint" style="text-align:center;">Or on player.html, enter this code and a name to join.</p>
 
     <div class="q-header" style="margin-top:24px;">
       <span class="player-count-label">${players.length} player${players.length === 1 ? "" : "s"} joined</span>
@@ -384,6 +391,11 @@ function renderLobby() {
     <p class="hint">${currentQuestions.length} questions · ${currentSeconds}s each · faster correct answers score more</p>
   `;
   animateCardIn();
+  const qrBox = document.getElementById("qrBox");
+  if (qrBox && window.QRCode) {
+    qrBox.innerHTML = "";
+    new QRCode(qrBox, { text: playerJoinURL(roomCode), width: 132, height: 132, colorDark: "#1a1a1a", colorLight: "#ffffff" });
+  }
   if (window.anime) {
     anime({ targets: "#chipGrid .player-chip", opacity: [0, 1], scale: [0.7, 1], delay: anime.stagger(40), duration: 320, easing: "easeOutBack" });
   }
@@ -437,6 +449,7 @@ function renderQuestionLive(idx, startedAt) {
       </div>
     </div>
     <p class="question-text">${esc(item.q)}</p>
+    ${item.img ? `<img class="q-img" src="${esc(item.img)}" alt="">` : ""}
     <div class="vote-rows" id="voteRows">
       ${item.options.map((opt, i) => voteRowHTML(SHAPES[i], opt, 0, 0, false)).join("")}
     </div>
@@ -518,7 +531,7 @@ function voteRowHTML(shape, optText, count, total, revealMode, isCorrect, names)
     <div class="vote-row ${revealMode && isCorrect ? "correct-row" : ""}" data-shape="${shape.key}">
       <span class="glyph ${shape.cls}">${shape.glyph}</span>
       <div class="bar-track">
-        <div class="bar-fill ${shape.cls}" style="width:${pct}%;" data-count="${count}"></div>
+        <div class="bar-fill ${shape.cls}" style="transform:scaleX(${pct/100});" data-count="${count}"></div>
         <span class="bar-label">${esc(optText)}${revealMode && isCorrect ? " ✓" : ""}</span>
       </div>
       <span class="bar-count">${count}</span>
@@ -550,7 +563,7 @@ function updateVoteRows(counts, correctIdx) {
     const fill = row.querySelector(".bar-fill");
     const countEl = row.querySelector(".bar-count");
     const pct = total > 0 ? Math.round((counts[i] / total) * 100) : 0;
-    if (fill) fill.style.width = pct + "%";
+    if (fill) fill.style.transform = `scaleX(${pct / 100})`;
     if (countEl) countEl.textContent = counts[i];
     if (correctIdx !== null) row.classList.toggle("correct-row", i === correctIdx);
   });
@@ -581,6 +594,7 @@ async function revealAnswer(idx) {
   card.innerHTML = `
     <p class="eyebrow">Answer Revealed</p>
     <p class="question-text">${esc(item.q)}</p>
+    ${item.img ? `<img class="q-img" src="${esc(item.img)}" alt="">` : ""}
     <div class="answer-detail" x-data="{ showNames: false }">
       <div class="vote-rows" id="revealRows">
         ${item.options.map((opt, i) => voteRowHTML(SHAPES[i], opt, counts[i], total, true, i === item.answer, byChoice[i])).join("")}
@@ -602,7 +616,7 @@ async function revealAnswer(idx) {
   // host no longer has to click through every single question. Clicking
   // "Next Question" (or "Show Final Results") at any time jumps ahead
   // immediately and cancels the countdown.
-  const AUTO_ADVANCE_SECONDS = 6;
+  const AUTO_ADVANCE_SECONDS = 3;
   let secondsLeft = AUTO_ADVANCE_SECONDS;
   let advanced = false;
   const hintEl = document.getElementById("autoNextHint");
