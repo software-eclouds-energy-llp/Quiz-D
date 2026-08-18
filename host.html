@@ -355,7 +355,16 @@ async function createRoom() {
 
   playersRef.on("value", (snap) => {
     playersCache = snap.val() || {};
-    if (currentRoomState && currentRoomState.status === "lobby") renderLobby();
+    const status = currentRoomState && currentRoomState.status;
+    if (status === "lobby") {
+      renderLobby();
+    } else if (status === "running") {
+      renderRunning();
+      // Auto-finish once every player has completed their last question.
+      const players = Object.values(playersCache);
+      const total = currentQuestions.length;
+      if (players.length && players.every((p) => (p.progress || 0) >= total)) endGame();
+    }
   });
 
   roomRef.on("value", (snap) => {
@@ -415,8 +424,60 @@ function renderLobby() {
 }
 
 async function startGame() {
-  await roomRef.update({ qIndex: 0 });
-  await goToQuestion(0);
+  // Self-paced: the host just flips the room to "running". Each player then
+  // races through the questions on their own device; the host watches a live
+  // dashboard instead of driving every question.
+  await roomRef.update({ status: "running", startedAt: firebase.database.ServerValue.TIMESTAMP });
+  renderRunning();
+}
+
+// Live dashboard: who's on which question, live scores, who's finished.
+function renderRunning() {
+  const players = dashboardPlayers();
+  const total = currentQuestions.length;
+  const done = players.filter((p) => p.progress >= total).length;
+  footnote.textContent = `Room ${roomCode} · Live · ${done}/${players.length} finished`;
+  card.innerHTML = `
+    <span class="on-air"><span class="dot"></span>Game live</span>
+    <p class="eyebrow" style="margin-top:14px;">${esc(currentQuizName)}</p>
+    <h1 style="margin-top:0;">Race in progress</h1>
+    <p class="lead">${players.length} player${players.length === 1 ? "" : "s"} · ${total} questions · ${done} finished</p>
+    <div id="dashList">
+      ${players.length ? players.map((p, i) => dashRowHTML(p, i, total)).join("") : `<p class="hint">Waiting for players…</p>`}
+    </div>
+    <button class="btn btn-primary" id="endGameBtn">End game &amp; show results</button>
+    <p class="hint" style="text-align:center;">Ends automatically once everyone finishes.</p>
+  `;
+  animateCardIn();
+  const btn = document.getElementById("endGameBtn");
+  if (btn) btn.addEventListener("click", endGame);
+}
+
+function dashboardPlayers() {
+  const total = currentQuestions.length;
+  return Object.entries(playersCache)
+    .map(([id, p]) => ({ id, name: p.name || "Player", score: p.score || 0, progress: Math.min(p.progress || 0, total) }))
+    .sort((a, b) => b.score - a.score);
+}
+
+function dashRowHTML(p, i, total) {
+  const isDone = p.progress >= total;
+  const rankClass = i === 0 ? "gold" : i === 1 ? "silver" : i === 2 ? "bronze" : "";
+  const status = isDone
+    ? `<span class="dash-done">✓ Done</span>`
+    : `<span class="dash-progress">Q${Math.min(p.progress + 1, total)}<span class="dash-of">/${total}</span></span>`;
+  return `
+    <div class="dash-row">
+      <span class="rank ${rankClass}">${i + 1}</span>
+      <span class="dash-name">${esc(p.name)}</span>
+      ${status}
+      <span class="dash-score">${p.score}</span>
+    </div>`;
+}
+
+async function endGame() {
+  if (currentRoomState && currentRoomState.status === "final") return;
+  await renderFinal(); // renderFinal itself flips the room to "final"
 }
 
 async function goToQuestion(idx) {

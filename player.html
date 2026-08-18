@@ -60,6 +60,10 @@ let playersRef = null;
 let answersRef = null;
 let myName = "";
 let lastRenderedKey = null; // `${status}:${qIndex}` — avoids redundant re-renders
+let myQ = 0;              // self-paced: which question THIS player is on
+let selfStarted = false;  // guard so the self-paced run only kicks off once
+let finishedSelf = false; // this player has answered their last question
+const SELF_FEEDBACK_SECONDS = 3; // how long the result screen holds before auto-advancing
 let qStartedAtLocal = null;
 let hasAnsweredThisQ = false;
 let feedbackShown = false; // guards against showing feedback twice (instant local vs. host's broadcast reveal)
@@ -71,7 +75,7 @@ let scoresListenerRef = null; // live standings listener on the feedback screen
 let reactionsRef = null; // per-room emoji reactions feed
 let feedbackTimer = null; // countdown interval on feedback screen
 let myPrevRank = null; // my rank after the previous question, for the "you moved up" delta
-let rankSettledForQ = -1; // question index whose rank delta has been locked in
+let myLiveRank = null; // my most recent live rank, settled into myPrevRank on advance
 const _prefilledCode = (new URLSearchParams(location.search).get("code") || "").replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 4);
 
 /* ---------- Sound effects (Web Audio, no library) ---------- */
@@ -239,31 +243,22 @@ function listenToRoom() {
     if (Array.isArray(room.questions) && room.questions.length) quizQuestions = room.questions;
     if (room.questionSeconds) quizSeconds = room.questionSeconds;
 
-    const key = room.status + ":" + room.qIndex;
+    // Self-paced: the room only signals lobby -> running -> final. Each player
+    // drives their own way through the questions once the host starts; the host
+    // never advances anyone, and nobody waits on anyone else.
     if (room.status === "lobby") {
-      if (lastRenderedKey !== key) { lastRenderedKey = key; renderWaiting(); }
-    } else if (room.status === "question") {
-      if (lastRenderedKey !== key) {
-        lastRenderedKey = key;
-        hasAnsweredThisQ = false;
-        feedbackShown = false;
-        qStartedAtLocal = room.qStartedAt || Date.now();
-        renderQuestion(room.qIndex, qStartedAtLocal);
-      }
-    } else if (room.status === "reveal") {
-      if (lastRenderedKey !== key) {
-        lastRenderedKey = key;
-        renderFeedback(room.qIndex);
+      if (lastRenderedKey !== "lobby") { lastRenderedKey = "lobby"; renderWaiting(); }
+    } else if (room.status === "running") {
+      if (!selfStarted) {
+        selfStarted = true;
+        lastRenderedKey = "running";
+        // Keep final scores from being wiped when a finisher closes their tab.
+        playersRef.child(playerId).onDisconnect().cancel();
+        startSelfPaced();
       }
     } else if (room.status === "final") {
-      if (lastRenderedKey !== key) {
-        lastRenderedKey = key;
-        // The onDisconnect().remove() armed at join time exists to clear
-        // "ghost" players who bail out of the lobby before a game starts —
-        // but left armed for the whole game, it also erases every player
-        // the instant they close their tab after finishing, which is
-        // exactly what people do right after a game ends. Cancel it here
-        // so final scores survive that and still show up in Game History.
+      if (lastRenderedKey !== "final") {
+        lastRenderedKey = "final";
         playersRef.child(playerId).onDisconnect().cancel();
         renderFinal();
       }
@@ -294,6 +289,71 @@ function renderWaiting() {
     </div>
   `;
   animateCardIn();
+}
+
+/* ---------- Self-paced run ---------- */
+
+function startSelfPaced() {
+  myQ = 0;
+  streak = 0;
+  finishedSelf = false;
+  showMyQuestion();
+}
+
+// Render whichever question this player is currently on, or finish.
+function showMyQuestion() {
+  if (!quizQuestions.length) return; // questions not synced yet; snapshot will retry
+  if (myQ >= quizQuestions.length) { finishSelf(); return; }
+  hasAnsweredThisQ = false;
+  feedbackShown = false;
+  qStartedAtLocal = Date.now();
+  // Publish progress so the host dashboard can show where everyone is.
+  playersRef.child(playerId).update({ progress: myQ });
+  renderQuestion(myQ, qStartedAtLocal);
+}
+
+function advanceSelf() {
+  clearInterval(feedbackTimer);
+  stopFeedbackListeners();
+  if (myLiveRank != null) myPrevRank = myLiveRank; // settle rank for next question's delta
+  myQ += 1;
+  showMyQuestion();
+}
+
+// This player answered their last question — mark done and wait for the rest.
+function finishSelf() {
+  finishedSelf = true;
+  clearInterval(localTimer);
+  clearInterval(feedbackTimer);
+  playersRef.child(playerId).update({ progress: quizQuestions.length, finishedAt: firebase.database.ServerValue.TIMESTAMP });
+  footnote.textContent = `Room ${roomCode} · Finished`;
+  card.innerHTML = `
+    <div class="reaction-stage" id="reactionStage"></div>
+    <div class="feedback-hero is-correct">
+      <div class="glyph-big">🏁</div>
+      <p class="fh-title">All done!</p>
+      <p class="fh-sub">You scored <strong>${myScore}</strong>. Hang tight while the rest finish.</p>
+    </div>
+    <span class="player-count-label standings-label">Live standings</span>
+    <div id="miniBoard"></div>
+    <div class="reaction-bar" id="reactionBar">
+      <button class="reaction-btn" data-emoji="🔥" type="button" aria-label="React fire">🔥</button>
+      <button class="reaction-btn" data-emoji="😅" type="button" aria-label="React nervous">😅</button>
+      <button class="reaction-btn" data-emoji="🤔" type="button" aria-label="React thinking">🤔</button>
+    </div>
+  `;
+  animateCardIn();
+  wireReactions();
+  // Keep the standings board live on the finish screen too.
+  if (scoresListenerRef) scoresListenerRef.off();
+  scoresListenerRef = playersRef;
+  scoresListenerRef.on("value", (snap) => {
+    const players = snap.val() || {};
+    const list = Object.entries(players)
+      .map(([id, p]) => ({ id, name: p.name || "Player", score: p.score || 0 }))
+      .sort((a, b) => b.score - a.score);
+    renderMiniBoard(list);
+  });
 }
 
 /* ---------- Question screen ---------- */
@@ -449,7 +509,6 @@ function paintFeedback(idx, mine) {
     <div class="q-header" style="justify-content:center;">
       <span class="player-count-label">Your total score: <span id="myScoreReadout">${myScore}</span></span>
     </div>
-    <p class="hint" style="text-align:center;"><span id="liveAnswered">…</span> answered</p>
     <p class="hint" id="qCountdown" style="text-align:center;font-weight:800;"></p>
 
     <span class="player-count-label standings-label">Live standings</span>
@@ -489,20 +548,10 @@ function stopFeedbackListeners() {
 // Live answer count + countdown to question end, shown after this player
 // answered so they don't stare at a dead "waiting" screen.
 function startFeedbackLive(idx) {
-  const answeredEl = () => document.getElementById("liveAnswered");
   const cdEl = () => document.getElementById("qCountdown");
 
-  let total = 0;
-  playersRef.once("value").then((s) => { total = s.numChildren(); }).catch(() => {});
-
-  if (liveCountRef) liveCountRef.off();
-  liveCountRef = answersRef.child(idx);
-  liveCountRef.on("value", (snap) => {
-    const el = answeredEl();
-    if (el) el.textContent = total ? `${snap.numChildren()} / ${total}` : snap.numChildren();
-  });
-
-  // Live standings + rank movement — updates as the rest of the room answers.
+  // Live standings + rank movement — driven by total scores, so it stays
+  // meaningful even though everyone is on a different question now.
   if (scoresListenerRef) scoresListenerRef.off();
   scoresListenerRef = playersRef;
   scoresListenerRef.on("value", (snap) => {
@@ -510,22 +559,22 @@ function startFeedbackLive(idx) {
     const list = Object.entries(players)
       .map(([id, p]) => ({ id, name: p.name || "Player", score: p.score || 0 }))
       .sort((a, b) => b.score - a.score);
-    total = list.length;
     renderMiniBoard(list);
     renderRankDelta(list, idx);
   });
 
+  // Self-advance: this player's own short pause before their next question.
   clearInterval(feedbackTimer);
-  const endAt = (qStartedAtLocal || Date.now()) + quizSeconds * 1000;
+  const endAt = Date.now() + SELF_FEEDBACK_SECONDS * 1000;
+  const isLast = idx >= quizQuestions.length - 1;
   const tick = () => {
     const el = cdEl();
-    if (!el) return;
     const left = Math.ceil((endAt - Date.now()) / 1000);
-    el.textContent = left > 0 ? `Next question in ${left}s` : "Wrapping up…";
-    if (left <= 0) clearInterval(feedbackTimer);
+    if (el) el.textContent = left > 0 ? `${isLast ? "Finishing" : "Next question"} in ${left}s` : "…";
+    if (left <= 0) { clearInterval(feedbackTimer); advanceSelf(); }
   };
   tick();
-  feedbackTimer = setInterval(tick, 250);
+  feedbackTimer = setInterval(tick, 200);
 }
 
 // Top 5 standings, my own row highlighted — reuses the final-screen table.
@@ -558,12 +607,7 @@ function renderRankDelta(list, idx) {
   else if (rank < myPrevRank) { cls = "up"; arrow = "▲"; label = `Up to #${rank}`; }
   else if (rank > myPrevRank) { cls = "down"; arrow = "▼"; label = `Down to #${rank}`; }
   el.innerHTML = `<span class="rank-delta ${cls}"><span class="rd-arrow">${arrow}</span>${label}</span>`;
-  // Settle this question's rank once the timer's run out, so next question's
-  // delta compares against a final standing rather than a mid-answer one.
-  if (Date.now() > (qStartedAtLocal || 0) + quizSeconds * 1000 && rankSettledForQ !== idx) {
-    myPrevRank = rank;
-    rankSettledForQ = idx;
-  }
+  myLiveRank = rank; // captured on advance so the next question compares against it
 }
 
 // Wire the emoji buttons + start listening for everyone's reactions.

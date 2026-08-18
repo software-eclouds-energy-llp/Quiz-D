@@ -567,6 +567,46 @@ table.leaderboard tr.me td { background: var(--soft-bg); font-weight: 700; }
 .rank.silver { background: #D6DEE5; color: #45505A; }
 .rank.bronze { background: #E3B08A; color: #5C3A20; }
 
+/* ---------- Host live dashboard (self-paced race) ---------- */
+.dash-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border-radius: 12px;
+  background: var(--soft-bg);
+  margin-bottom: 8px;
+}
+.dash-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 700;
+  color: var(--text-dark);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dash-progress {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--teal);
+}
+.dash-progress .dash-of { color: var(--text-muted); font-weight: 400; }
+.dash-done {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 12.5px;
+  color: var(--mint);
+  letter-spacing: 0.3px;
+}
+.dash-score {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--teal-dark);
+  min-width: 46px;
+  text-align: right;
+}
+
 @media (max-width: 360px) {
   table.leaderboard { font-size: 13px; }
   table.leaderboard th, table.leaderboard td { padding: 8px 8px; }
