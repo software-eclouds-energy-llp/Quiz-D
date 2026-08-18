@@ -127,6 +127,14 @@ input, textarea {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: clamp(12px, 3vw, 18px);
+  animation: tb-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes tb-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .topbar { animation: none; }
 }
 .tb-brand {
   font-family: var(--font-display);
@@ -543,12 +551,29 @@ input[type="text"]:focus { border-color: var(--teal); }
   padding: 30px 10px;
 }
 .feedback-hero .glyph-big {
+  position: relative;
   width: 74px; height: 74px;
   border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
   font-size: 34px;
   color: var(--white);
   margin: 0 auto 18px;
+}
+/* Spotlight halo that rings out from behind the verdict glyph (animated in JS). */
+.verdict-ring {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 74px; height: 74px;
+  margin: -37px 0 0 -37px;
+  border-radius: 50%;
+  border: 3px solid currentColor;
+  opacity: 0;
+  pointer-events: none;
+}
+.feedback-hero.is-correct .verdict-ring { color: var(--mint); }
+.feedback-hero.is-wrong .verdict-ring { color: var(--wrong); }
+@media (prefers-reduced-motion: reduce) {
+  .verdict-ring { display: none; }
 }
 .feedback-hero.is-correct .glyph-big { background: var(--mint); }
 .feedback-hero.is-wrong .glyph-big { background: var(--wrong); }

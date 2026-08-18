@@ -131,7 +131,7 @@ function esc(str) {
 
 function animateCardIn() {
   if (window.anime) {
-    anime({ targets: "#card", opacity: [0, 1], translateY: [16, 0], duration: 420, easing: "easeOutQuad" });
+    anime({ targets: "#card", opacity: [0, 1], translateY: [16, 0], duration: 400, easing: "easeOutExpo" });
   }
 }
 
@@ -274,9 +274,19 @@ function listenToRoom() {
   });
 
   playersRef.child(playerId).child("score").on("value", (snap) => {
+    const prev = myScore;
     myScore = snap.val() || 0;
     const scoreEl = document.getElementById("myScoreReadout");
-    if (scoreEl) scoreEl.textContent = myScore;
+    if (!scoreEl) return;
+    // Tick the total up to its new value instead of snapping — reads as points
+    // landing on a scoreboard.
+    if (window.anime && myScore !== prev) {
+      const counter = { v: prev };
+      anime({ targets: counter, v: myScore, round: 1, duration: 560, easing: "easeOutExpo",
+        update: () => { scoreEl.textContent = counter.v; } });
+    } else {
+      scoreEl.textContent = myScore;
+    }
   });
 
   // The host may spin a last-place dare after the final screen is already
@@ -507,10 +517,10 @@ function paintFeedback(idx, mine) {
   card.innerHTML = `
     <div class="reaction-stage" id="reactionStage"></div>
     <div class="feedback-hero ${correct ? "is-correct" : "is-wrong"}">
-      <div class="glyph-big" id="feedbackGlyph">${correct ? "✓" : "✕"}</div>
+      <div class="glyph-big" id="feedbackGlyph"><span class="verdict-ring" id="verdictRing"></span>${correct ? "✓" : "✕"}</div>
       <p class="fh-title">${correct ? "Correct!" : (mine && mine.choice === null ? "Time's up" : "Not quite")}</p>
       <p class="fh-sub">${esc(item.options[item.answer])}</p>
-      <p class="fh-points">${correct ? "+" + points + " points" : "+0 points"}</p>
+      <p class="fh-points" id="fhPoints">${correct ? "+0 points" : "+0 points"}</p>
       ${streakBadge}
       <div id="rankDelta"></div>
     </div>
@@ -533,16 +543,35 @@ function paintFeedback(idx, mine) {
   if (correct) playCorrect(); else playWrong();
   startFeedbackLive(idx);
   if (window.anime) {
+    // Focal verdict sting: the glyph lands, a single spotlight halo rings out
+    // from behind it, and the points tick up like a game-show scoreboard.
     anime({
       targets: "#feedbackGlyph",
-      scale: [0, 1],
-      rotate: correct ? [-12, 0] : [10, -6, 0],
-      duration: 520,
-      easing: "easeOutBack",
+      scale: [0.4, 1],
+      duration: 460,
+      easing: "easeOutExpo",
     });
-    if (streakBadge) {
-      anime({ targets: ".streak-badge", scale: [0, 1], opacity: [0, 1], duration: 420, delay: 200, easing: "easeOutBack" });
+    anime({
+      targets: "#verdictRing",
+      scale: [0.5, 1.85],
+      opacity: [0.7, 0],
+      duration: 640,
+      easing: "easeOutExpo",
+    });
+    const ptsEl = document.getElementById("fhPoints");
+    if (ptsEl && correct && points > 0) {
+      const counter = { v: 0 };
+      anime({
+        targets: counter, v: points, round: 1, duration: 620, delay: 120, easing: "easeOutExpo",
+        update: () => { ptsEl.textContent = "+" + counter.v + " points"; },
+      });
     }
+    if (streakBadge) {
+      anime({ targets: ".streak-badge", scale: [0.6, 1], opacity: [0, 1], duration: 380, delay: 260, easing: "easeOutExpo" });
+    }
+  } else {
+    const ptsEl = document.getElementById("fhPoints");
+    if (ptsEl) ptsEl.textContent = correct ? "+" + points + " points" : "+0 points";
   }
 }
 
@@ -614,7 +643,14 @@ function renderRankDelta(list, idx) {
   if (myPrevRank == null) { label = `You're #${rank}`; }
   else if (rank < myPrevRank) { cls = "up"; arrow = "▲"; label = `Up to #${rank}`; }
   else if (rank > myPrevRank) { cls = "down"; arrow = "▼"; label = `Down to #${rank}`; }
+  const changed = el.dataset.label !== label;
   el.innerHTML = `<span class="rank-delta ${cls}"><span class="rd-arrow">${arrow}</span>${label}</span>`;
+  el.dataset.label = label;
+  // Pop only when the standing actually changes, so live score updates don't
+  // make the chip twitch on every snapshot.
+  if (changed && window.anime) {
+    anime({ targets: "#rankDelta .rank-delta", scale: [0.85, 1], opacity: [0, 1], duration: 300, easing: "easeOutExpo" });
+  }
   myLiveRank = rank; // captured on advance so the next question compares against it
 }
 

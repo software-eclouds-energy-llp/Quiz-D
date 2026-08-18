@@ -81,6 +81,7 @@ let countdownTimer = null;
 let questionRevealing = false; // guards against double-reveal (timeout vs. everyone-answered racing)
 let autoAdvanceTimer = null; // ticks down on the reveal screen, then auto-continues
 let currentRoomState = null; // mirrors last known room snapshot
+let dashAnimated = false; // live dashboard rows dealt in once, then update silently
 
 // The quiz actually being played this game — chosen on the setup screen,
 // then embedded into the room so every player reads the same fixed list.
@@ -130,8 +131,8 @@ function animateCardIn() {
       targets: "#card",
       opacity: [0, 1],
       translateY: [16, 0],
-      duration: 420,
-      easing: "easeOutQuad",
+      duration: 400,
+      easing: "easeOutExpo",
     });
   }
 }
@@ -456,7 +457,15 @@ function renderRunning() {
     <button class="btn btn-primary" id="endGameBtn">End game &amp; show results</button>
     <p class="hint" style="text-align:center;">Ends automatically once everyone finishes.</p>
   `;
-  animateCardIn();
+  // Deal the standings in on the first live render only; later score updates
+  // re-render silently so the board updates without flashing on every tick.
+  if (!dashAnimated) {
+    animateCardIn();
+    if (window.anime) {
+      anime({ targets: "#dashList .dash-row", opacity: [0, 1], translateX: [-14, 0], delay: anime.stagger(45), duration: 340, easing: "easeOutExpo" });
+    }
+    dashAnimated = true;
+  }
   const btn = document.getElementById("endGameBtn");
   if (btn) btn.addEventListener("click", endGame);
 }
