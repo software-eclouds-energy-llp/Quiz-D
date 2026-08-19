@@ -461,6 +461,7 @@ function submitAnswer(idx, choice, startedAt, buttons, chosenBtn) {
   points += streakBonus;
 
   buttons.forEach((b) => { b.disabled = true; if (b !== chosenBtn) b.classList.add("dimmed"); });
+  chosenBtn.classList.add("selected");
   if (window.anime) {
     anime({ targets: chosenBtn, scale: [1, 1.06, 1], duration: 260, easing: "easeOutQuad" });
   }
